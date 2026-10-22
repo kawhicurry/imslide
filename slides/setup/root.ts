@@ -17,41 +17,53 @@ export default defineRootSetup(() => {
   let requestedRevision = -1;
   let publishedRevision = -1;
   let blocked = false;
+  const publishedKeys = new Map<string, string>();
   const app = getCurrentInstance()?.appContext.app;
   const previousHandler = app?.config.errorHandler;
   function fail(error: unknown) {
     if (disposed || blocked) return;
-    blocked = true; generation++; clearTimeout(timer);
+    blocked = true; generation++; clearTimeout(timer); timer = undefined;
     window.parent.postMessage({ type: 'imslide:render-error', error: renderFailure(error, { stage: 'renderer', revision: requestedRevision }) }, parentOrigin);
   }
   if (app) app.config.errorHandler = (error, instance, info) => { fail(error); previousHandler?.(error, instance, info); };
   const runtimeError = (event: ErrorEvent) => fail(event.error || event.message);
   const rejection = (event: PromiseRejectionEvent) => fail(event.reason);
-  const resourceError = (event: Event) => {
-    if (event.target instanceof HTMLImageElement || event.target instanceof HTMLLinkElement) fail(new Error('渲染资源加载失败'));
-  };
   window.addEventListener('error', runtimeError);
-  window.addEventListener('error', resourceError, true);
   window.addEventListener('unhandledrejection', rejection);
   async function bounded<T>(task: Promise<T>): Promise<T> {
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try { return await Promise.race([task, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error('后台页面渲染超时')), 20000); })]); }
     finally { clearTimeout(timeout); }
   }
-  const revision = (meta: Record<string, unknown>) => Number(meta.imslideRevision ?? (configs as { imslide?: { revision?: number } }).imslide?.revision);
+  const revision = (_meta: Record<string, unknown>) => Number((configs as { imslide?: { revision?: number } }).imslide?.revision ?? _meta.imslideRevision ?? 0);
   const paint = () => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
   function schedule() {
     if (disposed || blocked) return;
     generation++;
-    clearTimeout(timer);
-    // Coalesce markdown, CSS and frontmatter HMR into a single replacement.
-    timer = setTimeout(() => { void publish(); }, 450);
+    // Schedule once; a stream of HMR events must not keep postponing the deadline.
+    if (!timer) timer = setTimeout(() => { timer = undefined; void publish(); }, 450);
   }
   async function publish() {
     const version = generation;
-    const routes = [...nav.slides.value];
+    const allRoutes = [...nav.slides.value];
+    const { imslide: _state, ...visualConfig } = configs as typeof configs & { imslide?: unknown };
+    const configKey = JSON.stringify(visualConfig);
+    const keyOf = (route: (typeof allRoutes)[number]) => JSON.stringify([
+      route.no, route.meta.slide?.frontmatter.imslideContentKey ?? route.meta.slide?.content,
+      route.meta.slide?.frontmatter.layout, configKey,
+    ]);
+    const routes = allRoutes.filter(route => publishedKeys.get(String(route.meta.slide?.frontmatter.imslideId)) !== keyOf(route));
+    const contentRevision = revision({});
+    const order = allRoutes.map(route => String(route.meta.slide?.frontmatter.imslideId));
     const valid = () => !disposed && !blocked && generation === version;
     try {
+      if (contentRevision < requestedRevision) return;
+      if (!routes.length) {
+        if (!valid()) return;
+        publishedRevision = contentRevision;
+        window.parent.postMessage({ type: 'imslide:pages', pages: [], order, revision: contentRevision }, parentOrigin);
+        return;
+      }
       await bounded(Promise.all(routes.map(async route => {
         // Slidev's loader catches import errors and returns its error component.
         // Reject that fallback instead of publishing it as a successful slide.
@@ -69,13 +81,7 @@ export default defineRootSetup(() => {
       const content = container?.querySelector<HTMLElement>('#slide-content');
       if (!container || !content) throw new Error('后台页面结构不完整');
       if (document.querySelector('vite-error-overlay')) throw new Error('幻灯片编译失败');
-      const images = Array.from(container.querySelectorAll('img'));
-      images.forEach(image => { image.loading = 'eager'; });
-      await bounded(Promise.all(images.map(image => image.decode())));
-      await bounded(document.fonts.ready);
-      if (Array.from(document.fonts).some(font => font.status === 'error')) throw new Error('页面字体加载失败');
-      await paint();
-      if (!valid()) return;
+      // Resource readiness is checked once, in the replacement iframe, per changed page.
       const width = parseFloat(content.style.width) || 980;
       const height = parseFloat(content.style.height) || 552;
       // Copy stylesheet contents so a later HMR cannot mutate an already displayed page.
@@ -88,7 +94,12 @@ export default defineRootSetup(() => {
       }).join('\n');
       const pages = routes.map(route => {
         const meta = route.meta.slide?.frontmatter || {};
-        const clone = container.cloneNode(true) as HTMLElement;
+        const clone = container.cloneNode(false) as HTMLElement;
+        const clonedFrame = content.cloneNode(false) as HTMLElement;
+        const slideshow = document.createElement('div'); slideshow.id = 'slideshow';
+        const sourcePage = container.querySelector<HTMLElement>(`[data-slidev-no="${route.no}"]`);
+        if (!sourcePage) throw new Error('Slide DOM is not ready');
+        slideshow.append(sourcePage.cloneNode(true)); clonedFrame.append(slideshow); clone.append(clonedFrame);
         // Remove playback chrome and captured viewport scale, retaining slide styling.
         clone.style.background = 'white';
         const clonedContent = clone.querySelector<HTMLElement>('#slide-content');
@@ -102,13 +113,16 @@ export default defineRootSetup(() => {
         });
         if (!clone.querySelector(`[data-slidev-no="${route.no}"]`)) throw new Error('Slide DOM is not ready');
         if (clone.querySelector('.slidev-slide-loading')) throw new Error(`第 ${route.no} 页尚未完成渲染`);
+        clone.querySelectorAll('img').forEach(image => { image.loading = 'eager'; });
         clone.querySelectorAll('script,iframe,object,embed').forEach(element => element.remove());
         const html = `<!doctype html><html class="${document.documentElement.className}" style="${document.documentElement.style.cssText.replace(/"/g, '&quot;')}"><head><base href="${location.origin}/"><meta charset="utf-8">${styles}<style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:white}#slide-container{position:absolute!important;inset:0!important;width:100%!important;height:100%!important;background:white!important}*,*::before,*::after{animation:none!important;transition:none!important;caret-color:transparent!important}</style></head><body class="${document.body.className}">${clone.outerHTML}</body></html>`;
-        return { snapshot: crypto.randomUUID(), pageId: meta.imslideId, revision: revision(meta), page: route.no, total: routes.length, width, height, html };
+        return { snapshot: crypto.randomUUID(), pageId: meta.imslideId, revision: revision(meta), page: route.no, total: allRoutes.length, width, height, html };
       });
       if (!valid() || pages.some(page => page.revision < requestedRevision)) return;
-      publishedRevision = Math.min(...pages.map(page => page.revision));
-      window.parent.postMessage({ type: 'imslide:pages', pages }, parentOrigin);
+      for (const route of routes) publishedKeys.set(String(route.meta.slide?.frontmatter.imslideId), keyOf(route));
+      for (const id of publishedKeys.keys()) if (!order.includes(id)) publishedKeys.delete(id);
+      publishedRevision = contentRevision;
+      window.parent.postMessage({ type: 'imslide:pages', pages, order, revision: contentRevision }, parentOrigin);
     } catch (error) {
       // A failed replacement never removes the last complete visible document.
       if (valid()) fail(error);
@@ -130,7 +144,19 @@ export default defineRootSetup(() => {
     if (container) observer.observe(container, { childList: true, subtree: true, characterData: true });
     schedule();
   });
-  const afterUpdate = () => { blocked = false; schedule(); };
+  const afterUpdate = (payload: { updates?: Array<{ path: string; acceptedPath?: string }> }) => {
+    // A module can finish HMR after its frontmatter has already changed.
+    // Invalidate that page again rather than retaining an earlier DOM snapshot.
+    for (const update of payload.updates || []) {
+      const match = (update.acceptedPath || update.path).match(/\/@slidev\/slides\/(\d+)\/md/);
+      if (match) {
+        const route = nav.slides.value.find(route => route.no === Number(match[1]));
+        if (route) publishedKeys.delete(String(route.meta.slide?.frontmatter.imslideId));
+      }
+    }
+    if (blocked) { blocked = false; timer = undefined; }
+    schedule();
+  };
   const compileError = (payload: { err?: { message?: string } }) => fail(new Error(payload.err?.message || '幻灯片编译失败'));
   import.meta.hot?.on('vite:error', compileError);
   import.meta.hot?.on('vite:afterUpdate', afterUpdate);
@@ -140,7 +166,6 @@ export default defineRootSetup(() => {
     import.meta.hot?.off('vite:afterUpdate', afterUpdate);
     import.meta.hot?.off('vite:error', compileError);
     window.removeEventListener('error', runtimeError);
-    window.removeEventListener('error', resourceError, true);
     window.removeEventListener('unhandledrejection', rejection);
     if (app) app.config.errorHandler = previousHandler;
   });

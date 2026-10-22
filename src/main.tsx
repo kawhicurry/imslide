@@ -18,6 +18,7 @@ function App() {
   const [running, setRunning] = useState(false);
   const [previewReady, setPreviewReady] = useState(false);
   const [renderError, setRenderError] = useState<RenderFailure>();
+  const previewRevision = useRef(-1);
   const [cachedSlides, setCachedSlides] = useState<CachedSlide[]>([]);
   const [previewPresentation, setPreviewPresentation] = useState<{ blank: boolean }>();
   const [error, setError] = useState('');
@@ -60,8 +61,18 @@ function App() {
         return;
       }
       if (event.data?.type !== 'imslide:pages') return;
+      if (!Number.isInteger(event.data.revision) || event.data.revision < previewRevision.current) return;
+      previewRevision.current = event.data.revision;
       const pages = event.data.pages;
-      if (Array.isArray(pages) && pages.every(value => typeof value.snapshot === 'string' && typeof value.pageId === 'string' && typeof value.html === 'string' && Number.isInteger(value.revision) && value.width > 0 && value.height > 0)) setCachedSlides(pages);
+      if (Array.isArray(pages) && pages.every(value => typeof value.snapshot === 'string' && typeof value.pageId === 'string' && typeof value.html === 'string' && Number.isInteger(value.revision) && value.width > 0 && value.height > 0)) setCachedSlides(previous => {
+        const available = new Map(previous.map(slide => [slide.pageId, slide]));
+        for (const slide of pages) available.set(slide.pageId, slide);
+        const order: string[] = Array.isArray(event.data.order) ? event.data.order : pages.map(slide => slide.pageId);
+        return order.flatMap((id, index) => {
+          const slide = available.get(id);
+          return slide ? [{ ...slide, page: index + 1, total: order.length, revision: event.data.revision ?? slide.revision }] : [];
+        });
+      });
     };
     window.addEventListener('message', receive);
     return () => window.removeEventListener('message', receive);
@@ -126,17 +137,17 @@ function App() {
   }, []);
   useEffect(() => () => voice.current?.dispose(), []);
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }, [messages, activity, transcript]);
-  async function submit(text: string, utteranceId?: string) {
+  async function submit(text: string, utteranceId?: string, breakBefore?: boolean) {
     const trimmed = text.trim();
     if (!trimmed) return;
     const id = utteranceId ? `speech:${utteranceId}` : crypto.randomUUID();
     setError('');
-    setMessages(items => [...items, { id, role: 'user', text: trimmed, status: 'sending' }]);
+    setMessages(items => [...items, { id, role: 'user', text: trimmed, status: 'sending', breakBefore }]);
     // Serialize transport acknowledgments only. Never wait for an Agent run to finish.
     const task = outgoing.current.then(async () => {
       try {
         // Formatting never changes the command sent to the deck agent.
-        try {
+        if (!utteranceId) void (async () => { try {
           const response = await fetch('/api/text/paragraphs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: trimmed, previous: paragraphContext.current }) });
           if (!response.ok) throw new Error('分段失败');
           const formatted = await response.json();
@@ -144,7 +155,7 @@ function App() {
         } catch {
           // Keep the original text readable if the formatting service is unavailable.
           setMessages(items => items.map(item => item.id === id ? { ...item, breakBefore: true } : item));
-        }
+        } })();
         paragraphContext.current = Array.from(paragraphContext.current + trimmed).slice(-128).join('');
         const body = utteranceId ? { type: 'transcript', utteranceId, text: trimmed, isFinal: true, endOfUtterance: true } : { id, message: trimmed, mode: 'steer' };
         const response = await fetch(utteranceId ? '/api/input' : '/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -161,7 +172,7 @@ function App() {
   function toggleVoice() {
     if (listening) { voice.current?.stop(); return; }
     if (!voice.current) {
-      voice.current = new OverlapVoiceInput({ onTranscript: setTranscript, onListening: setListening, onError: setError, onSentence: (id, text) => { void submit(text, id); } });
+      voice.current = new OverlapVoiceInput({ onTranscript: setTranscript, onListening: setListening, onError: setError, onSentence: (id, text, breakBefore) => { void submit(text, id, breakBefore); } });
     }
     setError(''); voice.current.start();
   }

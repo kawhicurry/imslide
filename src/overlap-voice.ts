@@ -2,7 +2,7 @@ import { type ASRWord, type TranscriptView } from './transcript';
 import { VoiceChunks, type VoiceChunk } from './voice-chunks';
 export type OverlapCallbacks = {
   onTranscript(view: TranscriptView): void;
-  onSentence(id: string, text: string): void;
+  onSentence(id: string, text: string, breakBefore?: boolean): void;
   onListening(value: boolean): void;
   onError(message: string): void;
 };
@@ -11,10 +11,13 @@ export type OverlapCallbacks = {
 export class OverlapVoiceInput {
   private audio = new VoiceChunks();
   private fixed = '';
+  private tail = '';
   private pending = new Map<number, string>();
   private session = '';
   private sequence = 0;
-  private jobs = new Set<Promise<void>>();
+  private needsSilence = false;
+  private queue: Array<{ seq: number; chunk: VoiceChunk; result?: { raw: string; error?: string }; ready: Promise<void> }> = [];
+  private draining = false;
   private mergeQueue: Promise<void> = Promise.resolve();
   private controllers = new Set<AbortController>();
   private context?: AudioContext;
@@ -29,7 +32,7 @@ export class OverlapVoiceInput {
   private epoch = 0;
   private flushed?: () => void;
   constructor(private callbacks: OverlapCallbacks) {}
-  private render() { this.callbacks.onTranscript({ fixed: this.fixed, pending: [...this.pending.values()].join(''), processing: this.jobs.size > 0 }); }
+  private render() { this.callbacks.onTranscript({ fixed: this.fixed, pending: this.tail + [...this.pending.entries()].sort((a, b) => a[0] - b[0]).map(([, text]) => text).join(''), processing: this.draining || this.queue.length > 0 }); }
   private async request(url: string, options: RequestInit) {
     const controller = new AbortController(); this.controllers.add(controller);
     const timer = setTimeout(() => controller.abort(), 90000);
@@ -41,33 +44,61 @@ export class OverlapVoiceInput {
     } finally { clearTimeout(timer); this.controllers.delete(controller); }
   }
   private enqueue(chunk: VoiceChunk) {
+    // Check only new audio; the two-second overlap must not keep silence alive.
+    const offset = chunk.start === 0 ? 0 : Math.min(32000, chunk.samples.length);
+    let voicedFrames = 0;
+    for (let start = offset; start < chunk.samples.length; start += 320) {
+      const end = Math.min(start + 320, chunk.samples.length);
+      let energy = 0;
+      for (let i = start; i < end; i++) energy += chunk.samples[i] ** 2;
+      if (Math.sqrt(energy / (end - start)) >= 0.001) voicedFrames++;
+    }
+    const voiced = voicedFrames >= 3;
+    if (!voiced && !this.needsSilence) return;
+    // Keep one trailing silent window so a completed tail can be committed.
+    this.needsSilence = voiced;
     const seq = this.sequence++, epoch = this.epoch;
-    const alive = () => !this.disposed && epoch === this.epoch;
-    // Recognition starts immediately; merging remains in capture order.
-    const recognized = this.request('/api/asr', { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: chunk.samples.buffer as ArrayBuffer })
+    const item: (typeof this.queue)[number] = { seq, chunk, ready: Promise.resolve() };
+    item.ready = this.request('/api/asr', { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: chunk.samples.buffer as ArrayBuffer })
       .then(value => {
         if (!Array.isArray(value.words)) throw new Error('语音结果无效');
-        const raw = (value.words as ASRWord[]).map(w => w.text).join('');
-        if (alive()) { this.pending.set(seq, raw); this.render(); }
-        return { raw, error: undefined as string | undefined };
-      }).catch(error => ({ raw: '', error: (error as Error).message }));
-    const job = this.mergeQueue.then(async () => {
-      const result = await recognized;
+        item.result = { raw: (value.words as ASRWord[]).map(word => word.text).join('') };
+        if (!this.disposed && epoch === this.epoch) { this.pending.set(seq, item.result.raw); this.render(); }
+      }).catch(error => { item.result = { raw: '', error: (error as Error).message }; });
+    this.queue.push(item);
+    if (!this.draining) {
+      this.draining = true;
+      this.mergeQueue = this.drain(epoch).finally(() => { this.draining = false; if (!this.disposed) this.render(); });
+    }
+    this.render();
+  }
+  private async drain(epoch: number) {
+    const alive = () => !this.disposed && epoch === this.epoch;
+    while (this.queue.length && alive()) {
+      await this.queue[0].ready;
       if (!alive()) return;
-      const body = JSON.stringify({ session: this.session, seq, start: chunk.start, end: chunk.end, ...result });
-      let value: { append: string } | undefined;
+      const batch = [this.queue.shift()!];
+      // Never wait to form a batch. Only fold already-ready, consecutive backlog.
+      while (!batch[0].result?.error && batch.length < 4 && this.queue[0]?.result && !this.queue[0].result.error && this.queue[0].chunk.end - batch[0].chunk.start <= 24) batch.push(this.queue.shift()!);
+      const first = batch[0], last = batch[batch.length - 1];
+      const segments = batch.map(item => ({ seq: item.seq, start: item.chunk.start, end: item.chunk.end, raw: item.result!.raw }));
+      const body = JSON.stringify({ session: this.session, seq: last.seq, start: first.chunk.start, end: last.chunk.end,
+        raw: segments.map(segment => segment.raw).join('\n'), segments, error: first.result!.error });
+      let value: { append: string; pending?: string; breakBefore?: boolean } | undefined;
       for (let attempt = 0; attempt < 2; attempt++) {
         try { value = await this.request('/api/asr/merge', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }); break; }
-        catch (error) { if (!alive()) return; if (attempt === 1) this.callbacks.onError('第' + (seq + 1) + '段校准失败，保留虚字未提交：' + (error as Error).message); }
+        catch (error) { if (!alive()) return; if (attempt === 1) this.callbacks.onError('语音校准失败，保留虚字未提交：' + (error as Error).message); }
       }
       if (!alive()) return;
-      if (result.error) this.callbacks.onError('第' + (seq + 1) + '段识别失败：' + result.error + '；后续录音继续处理');
+      if (first.result!.error) this.callbacks.onError('语音识别失败：' + first.result!.error + '；后续录音继续处理');
       if (value) {
-        this.pending.delete(seq); this.fixed += value.append;
-        if (value.append.trim()) this.callbacks.onSentence(this.session + ':' + seq, value.append);
+        for (const item of batch) this.pending.delete(item.seq);
+        this.tail = value.pending || '';
+        this.fixed += (value.breakBefore && this.fixed ? '\n\n' : '') + value.append;
+        if (value.append.trim()) this.callbacks.onSentence(this.session + ':' + last.seq, value.append, value.breakBefore);
       }
-    }).finally(() => { this.jobs.delete(job); if (alive()) this.render(); });
-    this.jobs.add(job); this.mergeQueue = job.catch(() => {}); this.render();
+      this.render();
+    }
   }
   async start() {
     if (this.disposed || this.wanted || this.starting || this.stopping) return;
@@ -83,7 +114,7 @@ export class OverlapVoiceInput {
       context = new AudioContext({ sampleRate: 16000 });
       await context.audioWorklet.addModule('/pcm-capture.js'); await context.resume();
       if (epoch !== this.epoch || this.disposed) { stream.getTracks().forEach(t => t.stop()); await context.close(); return; }
-      this.audio = new VoiceChunks(); this.fixed = ''; this.pending.clear(); this.session = crypto.randomUUID(); this.sequence = 0; this.mergeQueue = Promise.resolve();
+      this.audio = new VoiceChunks(); this.fixed = ''; this.tail = ''; this.pending.clear(); this.session = crypto.randomUUID(); this.sequence = 0; this.needsSilence = false; this.queue = []; this.mergeQueue = Promise.resolve();
       this.context = context; this.stream = stream;
       this.source = context.createMediaStreamSource(stream);
       this.capture = new AudioWorkletNode(context, 'pcm-capture');

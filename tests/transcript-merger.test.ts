@@ -9,7 +9,7 @@ test('merge context is 128 Unicode characters, persisted and idempotent across r
   const dir = await mkdtemp(join(tmpdir(), 'voice-merge-'));
   t.after(() => rm(dir, {recursive:true,force:true}));
   const contexts: string[] = [];
-  const calibrate = async (context: string, input: {raw:string}) => { contexts.push(context); return input.raw; };
+  const calibrate = async (context: string, input: {raw:string}) => { contexts.push(context); return { append: input.raw, pending: '', breakBefore: false }; };
   const merger = new TranscriptMerger(dir, calibrate);
   const session = randomUUID();
   const first = {session, seq:0, start:0,end:4,raw:'字😀'.repeat(100)};
@@ -18,7 +18,7 @@ test('merge context is 128 Unicode characters, persisted and idempotent across r
   await merger.merge(second);
   assert.equal(Array.from(contexts[1]).length,128);
   const restarted = new TranscriptMerger(dir,calibrate);
-  assert.deepEqual(await restarted.merge(second),{seq:1,append:'继续'});
+  assert.deepEqual(await restarted.merge(second),{seq:1,append:'继续',pending:'',breakBefore:false});
   assert.equal(contexts.length,2);
   await assert.rejects(restarted.merge({...second,raw:'不同'}),/冲突/);
   const lines = (await readFile(join(dir,session+'.jsonl'),'utf8')).trim().split('\n');

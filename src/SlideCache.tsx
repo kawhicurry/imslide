@@ -26,7 +26,11 @@ export function SlideCache({ slides, pageId, onRendered, onError }: { slides: Ca
         const old = previous[slide.pageId] || {};
         if (failed.current.has(slide.snapshot)) { next[slide.pageId] = old; continue; }
         const latest = old.pending || old.visible;
-        next[slide.pageId] = latest && (latest.revision > slide.revision || (latest.revision === slide.revision && latest.html === slide.html)) ? old : { visible: old.visible, pending: slide };
+        if (latest && latest.snapshot === slide.snapshot) {
+          // Metadata can advance without reloading this document.
+          next[slide.pageId] = latest.revision === slide.revision && latest.page === slide.page && latest.total === slide.total ? old
+            : old.pending ? { ...old, pending: slide } : { visible: slide };
+        } else next[slide.pageId] = latest && latest.revision > slide.revision ? old : { visible: old.visible, pending: slide };
       }
       // A deleted visible slide stays until its replacement is ready.
       if (shown && !next[shown] && previous[shown]) next[shown] = previous[shown];
@@ -68,7 +72,7 @@ function CachedDocument({ slide, visible, onReady, onError }: { slide: CachedSli
     if (!completed.current) timer.current = setTimeout(() => fail(new Error('页面资源加载超时')), 20000);
     const observer = new ResizeObserver(resize); observer.observe(element); resize();
     return () => { generation.current++; clearTimeout(timer.current); observer.disconnect(); };
-  }, [slide]);
+  }, [slide.snapshot, slide.width, slide.height]);
   async function loaded() {
     const current = ++generation.current;
     const element = frame.current, doc = element?.contentDocument;
