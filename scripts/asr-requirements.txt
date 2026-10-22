@@ -1,0 +1,4 @@
+faster-whisper==1.2.1
+numpy==2.4.6
+opencc-python-reimplemented==0.1.7
+socksio==1.0.0

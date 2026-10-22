@@ -9,10 +9,11 @@ import type { AddressInfo } from 'node:net';
 import { createOpenAI } from '@ai-sdk/openai';
 import { serve, ImSlide, parseDeck, type CoreEvent } from '../imslide.ts';
 
-type Payload = { messages: { role: string; content: string }[] };
-function reply(res: ServerResponse, title?: string, action?: { action: string; page?: number }, namedTool?: string) {
+type Payload = { tool_choice?: string; max_completion_tokens?: number; messages: { role: string; content: string }[] };
+function reply(res: ServerResponse, title?: string, action?: { action: string; page?: number }, namedTool?: string, args: object = {}) {
+  if (!title && !action && !namedTool) namedTool = 'finish';
   res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-  const delta = title || action || namedTool ? { tool_calls: [{ index: 0, id: `call_${Math.random()}`, type: 'function', function: { name: namedTool || (action ? 'navigate' : 'update_current_page'), arguments: namedTool ? '{}' : JSON.stringify(action || { title, content: `# ${title}\n\n测试正文`, layout: 'center' }) } }] } : { content: '修改已保存。' };
+  const delta = title || action || namedTool ? { tool_calls: [{ index: 0, id: `call_${Math.random()}`, type: 'function', function: { name: namedTool || (action ? 'navigate' : 'update_page'), arguments: namedTool ? JSON.stringify(args) : JSON.stringify(action || { title, content: `# ${title}\n\n测试正文`, layout: 'center' }) } }] } : { content: '修改已保存。' };
   const chunk = (delta: unknown, finish_reason: string | null) => `data: ${JSON.stringify({ id: 'fixture-response', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta, finish_reason }] })}\n\n`;
   res.write(chunk({ role: 'assistant', ...delta }, null));
   res.write(chunk({}, title || action || namedTool ? 'tool_calls' : 'stop')); res.end('data: [DONE]\n\n');
@@ -96,7 +97,7 @@ test('steer enters the running stream before its next step; obsolete tool never 
   } finally { release.resolve(); await f.cleanup(); }
 });
 
-test('a finalized sentence steers a text-only final response without a lost-tail race', { timeout: 15000 }, async () => {
+test('a finalized sentence steers a finish call without a lost-tail race', { timeout: 15000 }, async () => {
   const started = deferred(), release = deferred(); let first = true;
   const f = await fixture(async (payload, res) => {
     if (first) { first = false; started.resolve(); await release.promise; reply(res); return; }
@@ -175,8 +176,8 @@ test('chat delete and clear execute Agent tools and persist exactly the remainin
     const last = payload.messages.at(-1)!;
     if (last.role === 'tool') reply(res);
     else if (last.content === '下一页') reply(res, undefined, { action: 'next' });
-    else if (last.content === '删掉当前页') reply(res, undefined, undefined, 'delete_current_page');
-    else if (last.content === '清空当前ppt') reply(res, undefined, undefined, 'clear_presentation');
+    else if (last.content === '删掉当前页') reply(res, undefined, undefined, 'delete_page', { pages: 2 });
+    else if (last.content === '清空当前ppt') reply(res, undefined, undefined, 'delete_page', { pages: 'all' });
     else reply(res, last.content);
   });
   try {
@@ -195,15 +196,15 @@ test('chat delete and clear execute Agent tools and persist exactly the remainin
     const retry = await chat('清空当前ppt', 'clear-once');
     assert.deepEqual(retry, cleared, 'a transport retry must not clear the new document twice');
     assert.deepEqual(parseDeck(await readFile(join(f.temp, 'slides.md'), 'utf8')), cleared);
-    assert.ok(f.events.some(e => e.type === 'tool' && e.name === 'delete_current_page'));
-    assert.ok(f.events.some(e => e.type === 'tool' && e.name === 'clear_presentation'));
+    assert.ok(f.events.some(e => e.type === 'tool' && e.name === 'delete_page'));
+    assert.ok(f.events.some(e => e.type === 'tool' && e.name === 'delete_page'));
     assert.equal(f.events.some(e => e.type === 'error'), false);
   } finally { await f.cleanup(); }
 });
 test('new steer cancels a pending delete before it mutates the page', { timeout: 15000 }, async () => {
   const started = deferred(), release = deferred(); let first = true;
   const f = await fixture(async (payload, res) => {
-    if (first) { first = false; started.resolve(); await release.promise; reply(res, undefined, undefined, 'delete_current_page'); }
+    if (first) { first = false; started.resolve(); await release.promise; reply(res, undefined, undefined, 'delete_page', { pages: 2 }); }
     else if (payload.messages.at(-1)?.role === 'user') reply(res, '保留并改标题');
     else reply(res);
   });
@@ -239,5 +240,23 @@ test('view selection and Agent editing share one stable page ID, without allowin
       assert.equal(rejected.status, 409);
     }
     assert.equal(f.core.snapshot().pages.length, 2);
+  } finally { await f.cleanup(); }
+});
+
+ test('tool-only requests suppress prose and keep historical page bodies out of later runs', { timeout: 15000 }, async () => {
+  const f = await fixture((payload, res) => {
+    assert.equal(payload.tool_choice, 'required');
+    if (payload.messages.at(-1)?.role === 'tool') reply(res);
+    else reply(res, '内容唯一标记');
+  });
+  try {
+    f.core.steer('创建封面'); await f.core.waitForIdle();
+    f.core.steer('标题保持不变'); await f.core.waitForIdle();
+    assert.equal(f.events.some(e => e.type === 'error'), false);
+    assert.equal(f.events.some(e => e.type === 'text'), false);
+    const secondRun = f.requests[2];
+    assert.equal(secondRun.messages.filter(m => m.role === 'assistant' || m.role === 'tool').length, 0);
+    assert.equal(secondRun.messages.filter(m => m.role === 'system').length, 1);
+    assert.equal(f.requests.length, 4);
   } finally { await f.cleanup(); }
 });

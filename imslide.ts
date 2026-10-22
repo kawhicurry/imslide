@@ -4,7 +4,11 @@
  * slides.md is the sole active document store; the web viewer never mutates it.
  */
 import 'dotenv/config';
+import { prompts, slideEditorSystemPrompt } from './prompt.ts';
 import express from 'express';
+import { TranscriptMerger, calibrator, mergeSchema } from './src/transcript-merger.ts';
+import { paragraphText } from './src/paragraphs.ts';
+import { LocalASR } from './src/asr-server.ts';
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -52,6 +56,21 @@ export function deleteCurrentPage(deck: Deck): Deck {
   next.current = Math.min(next.current, next.pages.length - 1);
   next.revision++;
   return next;
+}
+/** Resolve all requested page numbers before deleting anything. */
+export function deletePages(deck: Deck, pages: number | number[] | 'all'): Deck {
+  if (pages === 'all') return clearPresentation(deck);
+  const numbers = Array.isArray(pages) ? pages : [pages];
+  if (!numbers.length || numbers.some(page => !Number.isInteger(page) || page < 1 || page > deck.pages.length)) throw new Error('指定页面不存在');
+  const selected = new Set(numbers.map(page => page - 1));
+  const currentId = deck.pages[deck.current].id;
+  const remaining = deck.pages.filter((_, index) => !selected.has(index));
+  if (!remaining.length) return clearPresentation(deck);
+  const retainedCurrent = remaining.findIndex(page => page.id === currentId);
+  // Preserve selection by ID, or select the next surviving page then the previous.
+  const nextIndex = deck.pages.findIndex((_, index) => index > deck.current && !selected.has(index));
+  const current = retainedCurrent >= 0 ? retainedCurrent : nextIndex >= 0 ? remaining.findIndex(page => page.id === deck.pages[nextIndex].id) : remaining.length - 1;
+  return { pages: remaining, current, revision: deck.revision + 1 };
 }
 /** Reset the document without resetting its monotonically increasing revision. */
 export function clearPresentation(deck: Deck): Deck {
@@ -154,10 +173,7 @@ type Receipt = { runId: string; messageId: string; mode: 'start' | 'steer' };
 type Run = { id: string; pending: Instruction[]; inputs: Instruction[]; controller: AbortController; completion: Promise<void> };
 export type ImSlideOptions = { file?: string; model?: LanguageModel; quietMs?: number; onEvent?: (event: CoreEvent) => void; legacyFile?: string };
 const instructionSchema = z.object({ text: z.string().trim().min(1).max(8000), id: z.string().min(1).max(120) });
-const instructions = `你是 imslide 演示文稿编辑 Agent。使用中文。只能根据已确认的用户整句指令修改文稿。新注入的 user 消息是 steer：若与先前要求冲突，以最新要求为准，结合已提交的页面状态继续，不要重做已完成的操作。只有工具成功后才说已完成。
-默认只修改当前页，明确要求新增或翻页时才 navigate。next 在末页新增空白页，previous 保留内容，goto 页码从 1 开始。工具必须顺序调用，不要并行。同一步操作被标记 skipped 时不要声称已完成；下一步按新指令和最新状态重新规划。
-用户明确要求“删掉当前页/删除本页”时调用 delete_current_page；删除后优先显示下一页，末页被删除则显示上一页，唯一一页被删除则保留一张新空白页。用户明确要求“清空当前PPT/清空整份演示/清空所有页面”时调用 clear_presentation，重置为一张空白页，清空后不要重建历史内容。仅“清空当前页”则用 update_current_page 把当前页正文清空、标题改为空白页面、布局改为 default，保留其他页。询问含义、引用例子或明确否定删除/清空时不得执行删除工具。
-内容使用单页 Slidev Markdown，可有标题、正文、静态 HTML/CSS、https 图片、表格和代码块。禁止脚本、Vue 动态表达式、以 --- 开头的行（包括 ---- 分隔线；需要横线时用 ***）。两栏使用 ::right::。每页一主题，版面简洁。我们生成 Slidev，不是 .pptx。`;
+
 
 export class ImSlide {
   private deck: Deck;
@@ -220,13 +236,14 @@ export class ImSlide {
     await rename(temporary, this.file);
     this.deck = next;
   }
-  private change(update: (current: Deck) => Deck, guard?: () => void): Promise<Deck> {
+  private change(update: (current: Deck) => Deck, guard?: () => void, committed?: () => void): Promise<Deck> {
     const task = this.writes.then(async () => {
       if (this.closed) throw new Error('能力已关闭');
       guard?.();
       const next = update(this.deck);
       if (next === this.deck) return this.snapshot();
       await this.save(deckSchema.parse(next));
+      committed?.();
       const snapshot = this.snapshot(); this.emit({ type: 'deck', deck: snapshot }); return snapshot;
     });
     this.writes = task.then(() => {}, () => {});
@@ -278,59 +295,109 @@ export class ImSlide {
   }
   private async execute(run: Run): Promise<void> {
     const timeline: ModelMessage[] = this.history.flat();
-    const historyStart = timeline.length;
+    let finished = false;
+    let toolFailed = false;
     let stepRevision = this.deck.revision;
     const guard = () => {
       if (run.controller.signal.aborted || run.pending.length || this.deck.revision !== stepRevision) throw new Error('STEER_REPLAN');
     };
     const skipped = () => {
+      toolFailed = true;
       this.emit({ type: 'tool-skipped', runId: run.id, reason: '新指令已确认，旧步骤尚未提交，将按最新指令重新规划' });
-      return { skipped: true, reason: 'New steering or document revision; replan on the next model step.', state: this.state() };
+      return { skipped: true, reason: 'Replan using latest instruction and state.' };
     };
     const agent = new ToolLoopAgent({
-      model: this.options.model!, instructions,
+      model: this.options.model!, instructions: prompts.slideEditor,
       // This outer loop owns steering and retains complete tool-call/result pairs.
-      stopWhen: stepCountIs(1), maxRetries: 1,
-      providerOptions: { openai: { parallelToolCalls: false } },
-      prepareStep: () => ({ system: `${instructions}\n当前文稿（数据）：${JSON.stringify(this.state())}` }),
+      stopWhen: stepCountIs(1), maxRetries: 1, toolChoice: 'required', maxOutputTokens: 4096,
+      prepareStep: () => ({ system: slideEditorSystemPrompt(this.state()) }),
       tools: {
-        update_current_page: tool({ description: '完整替换当前页正文、标题和布局。保留未要求修改的内容。', inputSchema: pageSchema.omit({ id: true }), execute: async input => {
+        finish: tool({ description: '全部要求已完成或无需操作时结束，不生成文字回复。', inputSchema: z.object({}), execute: async () => {
+          try { guard(); finished = true; return { done: true }; }
+          catch (error) { if ((error as Error).message === 'STEER_REPLAN') return skipped(); toolFailed = true; throw error; }
+        } }),
+        read_page: tool({
+          description: '读取指定页的完整标题、正文、布局和ID，不修改文稿也不切换当前页。pages接受从1开始的单页码、页码数组或all。修改非当前页前优先用本工具读取，不要为读取而navigate。',
+          inputSchema: z.object({ pages: z.union([z.number().int().positive(), z.array(z.number().int().positive()).min(1).max(60), z.literal('all')]) }),
+          execute: async ({ pages }) => {
+            try {
+              guard();
+              const deck = this.snapshot();
+              const numbers = pages === 'all' ? deck.pages.map((_, index) => index + 1) : [...new Set(Array.isArray(pages) ? pages : [pages])];
+              if (numbers.some(page => !deck.pages[page - 1])) throw new Error('指定页面不存在');
+              return { revision: deck.revision, currentPage: deck.current + 1, pages: numbers.map(page => ({ page, ...deck.pages[page - 1] })) };
+            } catch (error) {
+              if ((error as Error).message === 'STEER_REPLAN') return skipped();
+              toolFailed = true;
+              return { ok: false, error: (error as Error).message };
+            }
+          },
+        }),
+        update_page: tool({ description: '完整替换指定页正文、标题和布局；page从1开始，省略时为当前页。不切换当前浏览页。保留未要求修改的内容。', inputSchema: pageSchema.omit({ id: true }).extend({ page: z.number().int().positive().optional() }), execute: async ({ page, ...input }) => {
           try {
             await this.change(current => {
               const next = structuredClone(current);
-              next.pages[next.current] = pageSchema.parse({ ...input, id: next.pages[next.current].id }); next.revision++;
+              const index = page === undefined ? next.current : page - 1;
+              if (!next.pages[index]) throw new Error('指定页面不存在');
+              next.pages[index] = pageSchema.parse({ ...input, id: next.pages[index].id }); next.revision++;
               return next;
-            }, guard);
+            }, guard, () => { stepRevision = this.deck.revision; });
             stepRevision = this.deck.revision;
-            return { state: this.state() };
-          } catch (error) { if ((error as Error).message === 'STEER_REPLAN') return skipped(); throw error; }
+            return { ok: true };
+          } catch (error) { if ((error as Error).message === 'STEER_REPLAN') return skipped(); toolFailed = true; throw error; }
         } }),
-        delete_current_page: tool({
-          description: '用户明确要求删除当前页时使用。仅删除 Agent 当前页，保留其他页；唯一一页删除后留一张空白页。',
-          inputSchema: z.object({}), execute: async () => {
+        edit_page: tool({
+          description: '精确替换指定页的部分文本，保留其他内容和浏览位置。page从1开始，省略为当前页；field默认content，也可改title。old_string必须原样匹配，未找到则不写入；多处匹配必须显式replace_all=true，否则请提供更多上下文。new_string为空表示删除匹配文本。',
+          inputSchema: z.object({
+            page: z.number().int().positive().optional(),
+            field: z.enum(['content', 'title']).default('content'),
+            old_string: z.string().min(1).max(24000),
+            new_string: z.string().max(24000),
+            replace_all: z.boolean().default(false),
+          }),
+          execute: async ({ page, field, old_string, new_string, replace_all }) => {
             try {
-              await this.change(deleteCurrentPage, guard);
-              stepRevision = this.deck.revision;
-              return { deleted: true, state: this.state() };
-            } catch (error) { if ((error as Error).message === 'STEER_REPLAN') return skipped(); throw error; }
+              let replacements = 0;
+              await this.change(current => {
+                const index = page === undefined ? current.current : page - 1;
+                const target = current.pages[index];
+                if (!target) throw new Error('指定页面不存在');
+                const pieces = target[field].split(old_string);
+                replacements = pieces.length - 1;
+                if (!replacements) throw new Error('old_string未匹配，请根据最新原文重新提供精确文本');
+                if (replacements > 1 && !replace_all) throw new Error('old_string匹配多处，请增加上下文或设置replace_all=true');
+                if (old_string === new_string) return current;
+                const next = structuredClone(current);
+                // Joining literal strings avoids replacement-token expansion such as $&.
+                next.pages[index] = pageSchema.parse({ ...target, [field]: pieces.join(new_string) });
+                next.revision++;
+                return next;
+              }, guard, () => { stepRevision = this.deck.revision; });
+              return { ok: true, replacements };
+            } catch (error) {
+              if ((error as Error).message === 'STEER_REPLAN') return skipped();
+              toolFailed = true;
+              return { ok: false, error: (error as Error).message };
+            }
           },
         }),
-        clear_presentation: tool({
-          description: '用户明确要求清空当前 PPT、整份演示或所有页时使用。移除全部已有页面，重置为一张新空白页。仅清空当前页不能使用此工具。',
-          inputSchema: z.object({}), execute: async () => {
+        delete_page: tool({
+          description: '删除指定的一页或多页。pages接受从1开始的页码、页码数组，或特殊值all清空整份演示。数组按删除前的页码一次处理，重复页码只删除一次。仅用户明确要求删除或清空时调用；删完后保留一张空白页。',
+          inputSchema: z.object({ pages: z.union([z.number().int().positive(), z.array(z.number().int().positive()).min(1).max(60), z.literal('all')]) }),
+          execute: async ({ pages }) => {
             try {
-              await this.change(clearPresentation, guard);
+              await this.change(current => deletePages(current, pages), guard, () => { stepRevision = this.deck.revision; });
               stepRevision = this.deck.revision;
-              return { cleared: true, state: this.state() };
-            } catch (error) { if ((error as Error).message === 'STEER_REPLAN') return skipped(); throw error; }
+              return { deleted: true };
+            } catch (error) { if ((error as Error).message === 'STEER_REPLAN') return skipped(); toolFailed = true; throw error; }
           },
         }),
         navigate: tool({ description: '前进、后退、跳至某页，或在当前页后新增空白页。', inputSchema: z.object({ action: z.enum(['next', 'previous', 'goto', 'add']), page: z.number().int().optional() }), execute: async ({ action, page }) => {
           try {
-            await this.change(current => navigate(current, action, page), guard);
+            await this.change(current => navigate(current, action, page), guard, () => { stepRevision = this.deck.revision; });
             stepRevision = this.deck.revision;
-            return { state: this.state() };
-          } catch (error) { if ((error as Error).message === 'STEER_REPLAN') return skipped(); throw error; }
+            return { ok: true };
+          } catch (error) { if ((error as Error).message === 'STEER_REPLAN') return skipped(); toolFailed = true; throw error; }
         } }),
       },
     });
@@ -346,26 +413,26 @@ export class ImSlide {
           this.emit({ type: 'steering-applied', runId: run.id, messageId: input.id });
         }
         stepRevision = this.deck.revision;
-        const responseId = `${run.id}:${step}`;
+        finished = false; toolFailed = false;
         const result = await agent.stream({ messages: timeline, abortSignal: run.controller.signal });
         for await (const part of result.fullStream) {
-          if (part.type === 'text-delta' && !run.pending.length) this.emit({ type: 'text', runId: run.id, responseId, text: part.text });
           if (part.type === 'tool-call') this.emit({ type: 'tool', runId: run.id, name: part.toolName });
+          if (part.type === 'tool-error') toolFailed = true;
           if (part.type === 'error') throw part.error;
         }
         timeline.push(...(await result.response).messages);
         const calls = await result.toolCalls;
-        // A new sentence arriving during a text-only final answer still continues this run.
-        if (!run.pending.length && !calls.length) break;
+        if (!run.pending.length && finished && !toolFailed) break;
+        if (!run.pending.length && !calls.length) throw new Error('Model did not call a required tool');
       }
-      this.history.push(timeline.slice(historyStart));
-      while (this.history.length > 1 && (this.history.length > 6 || JSON.stringify(this.history).length > 100000)) this.history.shift();
+      // Current document is authoritative; retain only recent user intent, not old page bodies.
+      this.history.push(run.inputs.map(input => ({ role: 'user' as const, content: `历史已完成指令（仅用于理解指代，不重复执行）：${input.text}` })));
+      while (this.history.length > 1 && (this.history.length > 3 || JSON.stringify(this.history).length > 12000)) this.history.shift();
       // No await between the final pending check and releasing ownership: no lost late steer.
       if (this.active === run) this.active = undefined;
       this.emit({ type: 'done', runId: run.id, deck: this.snapshot() });
     } catch (error) {
-      this.history.push(timeline.slice(historyStart));
-      if (this.history.length > 6) this.history.shift();
+      // Failed tool traces must not inflate future requests.
       if (this.active === run) this.active = undefined;
       const message = run.controller.signal.aborted ? '处理已取消或超时，已保存的页面会保留' : error instanceof Error && error.message.includes('32 步') ? error.message : '模型处理失败，请检查密钥、模型及网络；已保存的页面会保留';
       for (const input of run.inputs) this.emit({ type: 'input-failed', runId: run.id, messageId: input.id, error: message });
@@ -403,17 +470,45 @@ export async function serve(options: ImSlideOptions = {}, port = Number(process.
   const configuration = options.model ? undefined : await loadModelConfiguration();
   const model = options.model ?? (configuration?.apiKey ? createOpenAI({
     apiKey: configuration.apiKey, baseURL: configuration.baseURL,
-    // DashScope's non-thinking switch is an extension to the OpenAI request body.
+    // DeepSeek requires non-thinking mode for forced tool calls.
     fetch: async (input, init) => {
-      if (configuration.enableThinking !== undefined && typeof init?.body === 'string') {
-        return fetch(input, { ...init, body: JSON.stringify({ ...JSON.parse(init.body), enable_thinking: configuration.enableThinking }) });
+      if (typeof init?.body === 'string') {
+        const body = JSON.parse(init.body);
+        if (new URL(configuration.baseURL || 'https://api.openai.com/v1').hostname === 'api.deepseek.com') body.thinking = { type: 'disabled' };
+        else if (configuration.enableThinking !== undefined) body.enable_thinking = configuration.enableThinking;
+        return fetch(input, { ...init, body: JSON.stringify(body) });
       }
       return fetch(input, init);
     },
   }).chat(configuration.model) : undefined);
   const core = await ImSlide.open({ ...options, model });
   const app = express();
+  const asr = new LocalASR();
+  app.get('/api/asr/status', async (_req, res) => {
+    try { await asr.warmup(); res.json({ ready: true, local: true }); }
+    catch (error) { res.status(503).json({ error: (error as Error).message }); }
+  });
+  app.post('/api/asr', express.raw({ type: 'application/octet-stream', limit: '1536kb' }), async (req, res) => {
+    try {
+      if (!Buffer.isBuffer(req.body)) throw new Error('需要 PCM 音频');
+      res.json(await asr.transcribe(req.body));
+    } catch (error) { res.status(503).json({ error: (error as Error).message }); }
+  });
   app.use(express.json({ limit: '64kb' }));
+  const merger = model ? new TranscriptMerger(resolve('.data/transcripts'), calibrator(model)) : undefined;
+  app.post('/api/asr/merge', async (req, res) => {
+    try {
+      if (!merger) throw new Error('请先配置语音校准模型');
+      res.json(await merger.merge(mergeSchema.parse(req.body)));
+    } catch (error) { res.status(503).json({ error: (error as Error).message }); }
+  });
+  app.post('/api/text/paragraphs', async (req, res) => {
+    try {
+      if (!model) throw new Error('请先配置模型');
+      const { text, previous } = z.object({ text: z.string().min(1).max(8000), previous: z.string().max(512).default('') }).parse(req.body);
+      res.json(await paragraphText(model, text, previous));
+    } catch (error) { res.status(503).json({ error: (error as Error).message }); }
+  });
   app.get('/api/deck', (_req, res) => res.json(core.snapshot()));
   app.get('/api/status', (_req, res) => res.json({ configured: core.configured, model: configuration?.model ?? 'custom', running: core.running, mode: 'steer', manualEditing: false }));
   app.get('/api/preview-health', async (_req, res) => {
@@ -460,6 +555,7 @@ export async function serve(options: ImSlideOptions = {}, port = Number(process.
   app.use((_req, res) => res.status(404).json({ error: '不支持手动修改文稿，请通过 /api/chat 或 /api/input 与 Agent 交互' }));
   app.use((_err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => res.status(400).json({ error: '请求格式无效或过大' }));
   const server = app.listen(port, '127.0.0.1');
+  server.once('close', () => asr.close());
   return { core, server };
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url) && process.argv.includes('--serve')) {

@@ -2,7 +2,9 @@
 
 **Agent 文字/语音交互工作台 + 只读 Slidev 画布 + 单文件底层能力。**
 
-前端保留文字对话、语音输入和 Agent 流式回复。所有文稿创建、内容修改和翻页指令都交给 Agent 执行；没有手动新增页面、源码编辑或直接修改文稿的入口。画布、左侧页面列表与 Agent 共用一个当前页；选中已有页面后，后续指令就操作该页。
+前端保留文字指令、语音输入和工具执行状态。模型强制只调用工具，完成后调用 `finish`，不输出解释或完成总结。所有文稿创建、内容修改和翻页指令都交给 Agent 执行；没有手动新增页面、源码编辑或直接修改文稿的入口。画布、左侧页面列表与 Agent 共用一个当前页；选中已有页面后，后续指令就操作该页。
+
+系统提示词统一在 [`prompt.ts`](./prompt.ts) 配置，包括幻灯片编辑 Agent、动态文稿上下文前缀和语音转写校准器。修改后重启服务；开发模式会自动重载。
 
 底层的文稿读写、Vercel AI SDK Agent、语音整句稳定处理、steer 注入和本地接入接口均集中在 [`imslide.ts`](./imslide.ts)。所有页及当前页位置统一保存在 **`slides/slides.md` 一个文件**，Slidev 直接监听它并热更新。
 
@@ -65,9 +67,24 @@ await slides.close();
 
 ## 语音输入与外部识别接入
 
-前端提供麦克风入口，推荐使用 Chrome / Edge 并允许麦克风权限。浏览器识别草稿只在本地实时显示，不向 Agent 提交。当前句子的全部识别片段均已 final、说话结束且稳定 1200ms 后，才通过 `/api/input` 发送一次完整语句，标记 `endOfUtterance: true`。开始继续说话或出现新的 interim 会取消稳定计时；停止麦克风不会强制发送未定稿的半句。
+前端使用 AudioWorklet 连续采集 PCM，每 4 秒新增音频提交一次，携带前 2 秒重叠：窗口依次为 0–4、2–8、6–12 秒。录音与请求异步运行，不再等待文字连续两次一致，也不会因 24 秒未稳定而停录。本机 Whisper 工作进程排队识别，慢请求不会阻止继续采集。
 
-文字输入和已定稿的语音均可在 Agent 运行中继续发送，传输只等待接收确认，不等待上一轮完成，运行中进入同一个 run 的 steer 处理。Agent 的文本回复通过 SSE 实时显示在对话面板。
+识别结果按录音顺序交给配置的 LLM，仅带最近已写入的 128 个 Unicode 字符作为上下文，通过工具调用校正同音错字、去除口吃和重叠重复，追加合并。音频留在本机；原始转写及上下文会发送给已配置模型。校准后的文字显示实字并提交文稿 Agent；等待校准的原始文字显示虚字。校准不能保证消除所有误识别。
+
+点击停止会提交最后不足 4 秒的尾段并等待队列完成。失败片段提示错误，后续片段继续；校准失败的文字保留虚字且不执行。请求重试使用同一会话和片段编号，避免重复追加。原始转写、128 字上下文、校准追加内容及时间按会话记录在本机 `.data/transcripts/*.jsonl`（权限 600），不保存音频。服务重启后可从日志恢复合并上下文和去重结果。
+
+本机 ASR 首次配置（Python 3.11+；可通过 `ASR_PYTHON` 指定解释器）：
+
+```sh
+python3 -m venv .data/asr-venv
+.data/asr-venv/bin/pip install -r scripts/asr-requirements.txt
+.data/asr-venv/bin/python -c "from faster_whisper.utils import download_model; download_model('base')"
+# .env 中设置 ASR_PYTHON 为该 Python 的绝对路径，ASR_MODEL=base
+```
+
+运行时只加载本地模型缓存（也可把 `ASR_MODEL` 设为本机 CTranslate2 模型目录），不自动下载。依赖缺失会明确提示，文字输入仍可使用。`GET /api/asr/status` 预热模型，`POST /api/asr` 接受最长 24 秒的 16kHz 单声道 Float32 PCM，返回带时间戳的识别词。浏览器需要麦克风权限和 AudioWorklet 支持。
+
+文字输入和已定稿的语音均可在 Agent 运行中继续发送，传输只等待接收确认，不等待上一轮完成，运行中进入同一个 run 的 steer 处理。工具执行与文稿更新通过 SSE 实时显示，模型不再发送文本回复。
 
 也可以由外部调用方接自己的 ASR，将结果送给同一模块：
 
@@ -156,6 +173,28 @@ npm test
 
 这是单用户、本机运行能力；最多 60 页，每页正文 24,000 字符，运行中最多等待 16 条 steer，每个 run 最多接收 64 条指令、执行 32 步或持续 120 秒。一个文稿同时只能由一个能力实例管理，不支持多进程并发写同一文件。对话和语音去重记录不跨进程保留；失败后的已保存内容不会回滚。
 
-前端使用浏览器提供的语音识别服务，支持程度和可用性取决于浏览器及网络；外部接入方也可提供自己的 ASR。单文件底层处理识别事件，不直接识别音频。真实云端模型与真实麦克风识别尚需配置密钥、浏览器权限和服务后验证。没有 `.pptx` 转换或云部署；实时 Slidev 需要常驻 Node.js 和可写磁盘。现有 Slidev 52 传递依赖仍有审计报告，公开部署前需随上游升级并补充鉴权、文稿隔离。静态内容校验不等同于任意恶意代码沙箱。
+前端使用本机 Whisper 识别；核心文稿与 Agent 能力仍在 imslide.ts，音频识别适配器在 src/asr-server.ts 与 scripts/asr-worker.py。外部接入方仍可提供自己的 ASR。真实 DeepSeek 工具调用与合成中文音频的本机 ASR 已验证；真实用户麦克风和环境噪声仍需现场验收。没有 `.pptx` 转换或云部署；实时 Slidev 需要常驻 Node.js 和可写磁盘。现有 Slidev 52 传递依赖仍有审计报告，公开部署前需随上游升级并补充鉴权、文稿隔离。静态内容校验不等同于任意恶意代码沙箱。
 
 参考：[Vercel AI SDK 自定义循环与 prepareStep](https://ai-sdk.dev/docs/agents/loop-control)、[Slidev CLI](https://sli.dev/builtin/cli)。
+
+模型请求使用 `tool_choice=required`，每步最多输出 4096 tokens（包含工具参数）；当前页正文和页面目录按最新状态提供，跨轮只保留最近三轮用户指令，不重复携带旧页面正文及工具记录。工具返回简短结果。DeepSeek 请求关闭 thinking，以兼容强制工具调用。
+
+
+### 预览缓存与无缝切页
+
+嵌入的 Slidev 仅作为后台渲染器，提前加载并挂载所有页。每次文稿热更新后等待 450ms 合并更新，再生成包含独立样式的页面快照。前台为每页保留已就绪的 iframe，点击切页直接显示对应缓存，不经过 Slidev 路由转场。新版页面在隐藏 iframe 中等待字体、图片和布局就绪后整体替换；加载期间保持旧版，加载失败不清空画布。快照仅用于只读预览，文稿仍以 slides/slides.md 为准。页面 CSS 动画在快照中关闭，避免切换及热更新抖动。
+
+### 页面工具
+
+- `update_page({ page?, title, content, layout? })`：完整替换指定页，页码从 1 开始，省略 `page` 时更新当前页；保留页面 ID，不改变浏览位置。
+- `delete_page({ pages: 2 })`：删除单页。
+- `delete_page({ pages: [2, 4, 5] })`：以调用前页码一次性删除多页，自动去重；任一页码无效则整次不执行。
+- `delete_page({ pages: "all" })`：清空整份演示。删除后至少保留一张空白页；当前页未删除时保持其 ID，删除时选下一张存活页，否则选上一张。
+
+旧的 `update_current_page`、`delete_current_page`、`clear_presentation` 不再暴露给模型；`navigate` 和 `finish` 保持不变。
+
+`edit_page({ page?, field?: "content" | "title", old_string, new_string, replace_all?: boolean })` 精确修改局部文本。页码从 1 开始，默认当前页；默认修改正文。未找到匹配或出现多处匹配且未指定 `replace_all: true` 时返回错误，不写入。`new_string: ""` 删除匹配文本；替换后仍执行页面内容校验。
+
+Agent 允许单次响应产生多个工具调用，沿用 AI SDK 默认执行调度，不添加工具串行队列。仅底层 Markdown 写入保持原子串行保存，防止同时写文件；同批自身修改不会误触发旧版本保护，外部选页和新 steer 仍会阻止过期操作。互相依赖的工具需等上一轮结果；本批任一工具失败时，即使出现 `finish` 也不会提前宣告完成。
+
+`read_page({ pages: 2 | [2, 4] | "all" })` 读取指定页、多页或全部页，返回 `{ revision, currentPage, pages: [{ page, id, title, content, layout }] }`。页码从 1 开始，数组去重，非法页码整次返回错误；读取不会写文件、增加版本或改变浏览位置。修改非当前页先读取，再基于结果调用 `edit_page` / `update_page`。
