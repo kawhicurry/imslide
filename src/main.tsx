@@ -172,7 +172,7 @@ function App() {
       <main className="main-area" ref={canvas}>
         <div className="canvas-toolbar"><div><Radio size={13}/> 实时预览 <span className="divider"/> <span className="muted">{page?.title || '连接文稿中'}</span></div><span className="follow-button active">{synced ? '当前页已同步' : '正在同步画布…'}</span></div>
         <div className="canvas-region"><div className="slide-frame">
-          {previewReady && deck && <iframe ref={frame} tabIndex={-1} title="Slidev 只读预览" src={`${previewOrigin}/1?embedded=true`} onLoad={syncFrame} style={{ opacity: synced ? 1 : 0 }}/>}
+          {previewReady && deck && <iframe ref={frame} tabIndex={-1} title="Slidev 只读预览" src={`${previewOrigin}/1?embedded=true&imslideParent=${encodeURIComponent(location.origin)}`} onLoad={syncFrame} style={{ opacity: synced ? 1 : 0 }}/>}
           {!synced && <div className="placeholder">{previewReady ? `正在同步第 ${index + 1} 页…` : '正在连接 Slidev 渲染服务…'}</div>}
           {synced && page && !page.content && <div className="placeholder blank"><Layers size={28} strokeWidth={1}/><p>空白页面</p><span>等待底层 Agent 写入内容</span></div>}
         </div><div className="slide-under"><span>SLIDE {String(index + 1).padStart(2, '0')}</span><span>16:9 <span className="divider"/> Slidev Markdown</span></div></div>

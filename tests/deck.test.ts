@@ -69,3 +69,17 @@ test('clear presentation keeps one fresh blank page and persists the reset with 
   assert.ok(!deck.pages.some(page => page.id === cleared.pages[0].id));
   assert.deepEqual(parseDeck(renderDeck(cleared)), cleared);
 });
+
+test('Slidev separators with four dashes cannot turn one application page into two slides', async () => {
+  const { parseSync } = await import('@slidev/parser');
+  for (const separator of ['---', '----', '-----', '--- # separator']) {
+    const content = `# A\n\n${separator}\n\n# B`;
+    assert.equal(pageSchema.safeParse({ id: 'one', title: 'one', layout: 'default', content }).success, false);
+  }
+  let deck = initialDeck(); deck.pages[0].content = '# A\n\n***\n\n# still A';
+  deck = navigate(deck, 'next'); deck.pages[1].content = '# B';
+  const slides = parseSync(renderDeck(deck), 'slides.md').slides;
+  assert.equal(slides.length, deck.pages.length);
+  assert.deepEqual(slides.map(slide => slide.frontmatter.imslideId), deck.pages.map(page => page.id));
+  assert.ok(slides.every(slide => slide.frontmatter.imslideRevision === deck.revision));
+});

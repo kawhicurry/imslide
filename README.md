@@ -2,7 +2,7 @@
 
 **Agent 文字/语音交互工作台 + 只读 Slidev 画布 + 单文件底层能力。**
 
-前端保留文字对话、语音输入和 Agent 流式回复。所有文稿创建、内容修改和翻页指令都交给 Agent 执行；没有手动新增页面、源码编辑或直接修改文稿的入口。画布可浏览已有页面或跟随 Agent 当前页，浏览页码只存在前端，不改变 Agent 的当前页。
+前端保留文字对话、语音输入和 Agent 流式回复。所有文稿创建、内容修改和翻页指令都交给 Agent 执行；没有手动新增页面、源码编辑或直接修改文稿的入口。画布、左侧页面列表与 Agent 共用一个当前页；选中已有页面后，后续指令就操作该页。
 
 底层的文稿读写、Vercel AI SDK Agent、语音整句稳定处理、steer 注入和本地接入接口均集中在 [`imslide.ts`](./imslide.ts)。所有页及当前页位置统一保存在 **`slides/slides.md` 一个文件**，Slidev 直接监听它并热更新。
 
@@ -105,6 +105,7 @@ npm run serve
 | `GET /api/events` | SSE 事件流，连接时先发送当前文稿快照 |
 | `GET /api/status` | 是否配置模型、是否运行、steer 模式 |
 | `GET /api/preview-health` | Slidev 渲染服务状态 |
+| `POST /api/view` | 以 `{pageId}` 选择已有页，同步画布与 Agent 当前页 |
 
 前端文字对话使用 `POST /api/chat`（`{message, id?, mode: "steer"}`），已定稿语音与外部调用使用 `POST /api/input`。两者均返回接收确认，Agent 回复和页面更新通过 `/api/events` 流式返回。不提供手动新增/直接编辑文稿接口，只有 Agent 工具可以写入文稿：
 
@@ -136,9 +137,13 @@ curl -X POST http://127.0.0.1:3001/api/input \
                    前端只读画布 + Agent 对话面板
 ```
 
-页正文使用标准 Slidev Markdown；`---` 分隔页面，frontmatter 中的 `imslide`、`imslideId`、`imslideTitle` 保存当前页、版本和页面标识。不再使用第二份 JSON 文稿。原子替换源文件防止读取到半写入状态。
+页正文使用标准 Slidev Markdown；`---` 分隔页面，frontmatter 中的 `imslide`、`imslideId`、`imslideTitle`、`imslideRevision` 保存当前页、版本和页面标识。不再使用第二份 JSON 文稿。原子替换源文件防止读取到半写入状态。
 
-查看器默认跟随 Agent 的当前页。手动浏览已有页后暂停跟随，点击“跟随 Agent 当前页”恢复。查看器前后按钮在首尾禁用，不会自动创建页面。Slidev 内置编辑器也已关闭。
+当前页统一保存在 `deck.current`，前端没有第二套浏览游标。左侧或底部选择已有页面，通过 `POST /api/view` 提交稳定的 `pageId`；该接口只允许选择已有页，不能新增、删除或修改正文。随后发出的对话会等待选页确认，确保 Agent 操作的就是所选页面。运行中的旧工具若遇到页版本变化，会跳过并在新上下文中重新规划。
+
+`slides/setup/root.ts` 是 Slidev 渲染适配器。画布按页面 ID 和文稿版本导航，Slidev 回报实际渲染的 ID、页码、总页数和版本；四项匹配后才显示预览。新增或删除页面后先等待热更新，防止新页路由尚未就绪时落回旧页。适配器只在嵌入预览中启用，校验父窗口来源。
+
+单个页面正文禁止任何以 `---` 开头的行，包括 `----`：Slidev 会把它们识别为额外分页，需要横线时使用 `***`。每次保存还会使用官方 Slidev 解析器核对页面数量和 ID，确保应用一页严格对应 Slidev 一页。选页按钮在首尾禁用，不会自动创建页面。Slidev 内置编辑器也已关闭。
 
 ## 验证与边界
 

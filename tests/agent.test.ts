@@ -216,3 +216,28 @@ test('new steer cancels a pending delete before it mutates the page', { timeout:
     assert.ok(f.events.some(e => e.type === 'tool-skipped'));
   } finally { release.resolve(); await f.cleanup(); }
 });
+
+test('view selection and Agent editing share one stable page ID, without allowing manual creation', { timeout: 15000 }, async () => {
+  const f = await fixture((payload, res) => {
+    if (payload.messages.at(-1)?.role === 'tool') reply(res);
+    else if (payload.messages.at(-1)?.content === '下一页') reply(res, undefined, { action: 'next' });
+    else reply(res, '修改被选中的页');
+  });
+  try {
+    f.core.steer('下一页', 'second-page'); await f.core.waitForIdle();
+    const before = f.core.snapshot(); const firstId = before.pages[0].id;
+    const response = await fetch(f.base + '/api/view', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pageId: firstId }) });
+    assert.equal(response.status, 200); assert.equal((await response.json()).current, 0);
+    f.core.steer('修改当前页', 'edit-selected'); await f.core.waitForIdle();
+    const after = f.core.snapshot();
+    assert.equal(after.pages[0].id, firstId); assert.equal(after.pages[0].title, '修改被选中的页');
+    assert.deepEqual(after.pages[1], before.pages[1]); assert.equal(after.pages.length, 2);
+    assert.deepEqual(parseDeck(await readFile(join(f.temp, 'slides.md'), 'utf8')), after);
+    const noOpRevision = after.revision; await f.core.selectPage(firstId); assert.equal(f.core.snapshot().revision, noOpRevision);
+    for (const body of [{ pageId: 'missing-page' }, { action: 'add', pageId: firstId }]) {
+      const rejected = await fetch(f.base + '/api/view', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      assert.equal(rejected.status, 409);
+    }
+    assert.equal(f.core.snapshot().pages.length, 2);
+  } finally { await f.cleanup(); }
+});

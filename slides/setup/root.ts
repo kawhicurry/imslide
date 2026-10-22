@@ -1,11 +1,13 @@
 import { defineRootSetup } from '@slidev/types';
 import { configs, disableBuiltinSync, useNav } from '@slidev/client';
-import { nextTick, watch } from 'vue';
+import { nextTick, onUnmounted, watch } from 'vue';
 
 /** Renderer adapter: acknowledge the actual Slidev page, not just its URL. */
 export default defineRootSetup(() => {
-  if (window.parent === window || !location.search.includes('embedded') || !document.referrer) return;
-  const parentOrigin = new URL(document.referrer).origin;
+  if (window.parent === window || !location.search.includes('embedded')) return;
+  const parent = new URLSearchParams(location.search).get('imslideParent') || document.referrer;
+  if (!parent) return;
+  const parentOrigin = new URL(parent).origin;
   const nav = useNav();
   disableBuiltinSync();
   let desired: { pageId: string; revision: number } | undefined;
@@ -32,6 +34,13 @@ export default defineRootSetup(() => {
     void sync();
   };
   window.addEventListener('message', receive);
-  const unwatch = watch(() => [nav.currentSlideNo.value, nav.currentFrontmatter.value, nav.slides.value, (configs as { imslide?: unknown }).imslide], () => { void sync(); }, { deep: true, flush: 'post', immediate: true });
-  if (import.meta.hot) import.meta.hot.dispose(() => { window.removeEventListener('message', receive); unwatch(); });
+  const unwatch = watch(
+    () => [nav.currentSlideNo.value, ...nav.slides.value.map(slide => {
+      const meta = slide.meta.slide?.frontmatter || {};
+      return [slide.no, meta.imslideId, revision(meta)];
+    })],
+    () => { void sync(); },
+    { deep: true, flush: 'post', immediate: true },
+  );
+  onUnmounted(() => { window.removeEventListener('message', receive); unwatch(); });
 });
