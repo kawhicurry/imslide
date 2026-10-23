@@ -81,5 +81,6 @@ test('Slidev separators with four dashes cannot turn one application page into t
   const slides = parseSync(renderDeck(deck), 'slides.md').slides;
   assert.equal(slides.length, deck.pages.length);
   assert.deepEqual(slides.map(slide => slide.frontmatter.imslideId), deck.pages.map(page => page.id));
-  assert.ok(slides.every(slide => slide.frontmatter.imslideRevision === deck.revision));
+  assert.equal(slides[0].frontmatter.imslide.revision, deck.revision);
+  assert.ok(slides.every(slide => /^[a-f0-9]{64}$/.test(slide.frontmatter.imslideContentKey)));
 });

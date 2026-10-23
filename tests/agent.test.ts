@@ -5,6 +5,7 @@ import { once } from 'node:events';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import { createOpenAI } from '@ai-sdk/openai';
 import { serve, ImSlide, parseDeck, type CoreEvent } from '../imslide.ts';
@@ -258,5 +259,217 @@ test('view selection and Agent editing share one stable page ID, without allowin
     assert.equal(secondRun.messages.filter(m => m.role === 'assistant' || m.role === 'tool').length, 0);
     assert.equal(secondRun.messages.filter(m => m.role === 'system').length, 1);
     assert.equal(f.requests.length, 4);
+  } finally { await f.cleanup(); }
+});
+
+
+test('tool lifecycle exposes correlated inputs, success, returned failure and thrown failure', { timeout: 15000 }, async () => {
+  let step = 0;
+  const f = await fixture((_payload, res) => {
+    step++;
+    if (step === 1) reply(res, undefined, undefined, 'read_page', { pages: 1 });
+    else if (step === 2) reply(res, undefined, undefined, 'edit_page', { old_string: 'not present', new_string: 'replacement' });
+    else if (step === 3) reply(res, undefined, { action: 'goto', page: 99 });
+    else reply(res);
+  });
+  try {
+    f.core.steer('验证工具事件', 'lifecycle'); await f.core.waitForIdle();
+    const calls = f.events.filter(e => e.type === 'tool');
+    assert.equal(calls.length, 4);
+    for (const call of calls) {
+      assert.ok(call.callId); assert.ok(call.input);
+      const result = f.events.find(e => (e.type === 'tool-result' || e.type === 'tool-error') && e.runId === call.runId && e.callId === call.callId);
+      assert.ok(result, 'each call must have a correlated terminal event');
+      assert.ok(f.events.indexOf(result) > f.events.indexOf(call));
+    }
+    assert.ok(f.events.some(e => e.type === 'tool-result' && e.name === 'edit_page' && (e.output as { ok: boolean }).ok === false));
+    assert.ok(f.events.some(e => e.type === 'tool-error' && e.name === 'navigate' && e.error.includes('页面不存在')));
+    assert.ok(f.events.some(e => e.type === 'done'));
+  } finally { await f.cleanup(); }
+});
+
+test('tool lifecycle exposes a skipped call during steering', { timeout: 15000 }, async () => {
+  const started = deferred(), release = deferred(); let step = 0;
+  const f = await fixture(async (_payload, res) => {
+    if (++step === 1) { started.resolve(); await release.promise; reply(res, '旧操作'); }
+    else reply(res);
+  });
+  try {
+    f.core.steer('原指令', 'old'); await started.promise;
+    f.core.steer('新指令', 'new'); release.resolve(); await f.core.waitForIdle();
+    const skipped = f.events.find(e => e.type === 'tool-result' && (e.output as { skipped?: boolean })?.skipped);
+    assert.ok(skipped && skipped.type === 'tool-result');
+    assert.ok(f.events.some(e => e.type === 'tool' && e.callId === skipped.callId && e.runId === skipped.runId));
+    assert.equal(f.core.snapshot().revision, 0);
+  } finally { release.resolve(); await f.cleanup(); }
+});
+
+function replyVoice(res: ServerResponse, actions: object[], pending = '', needsFollowUp = false) {
+  reply(res, undefined, undefined, 'apply_voice', { completed: actions.length ? [{ instruction: '本片完整指令', actions }] : [], pending, needsFollowUp });
+}
+
+test('cumulative interim snapshots replace text; final confirmation never repeats an add', async () => {
+  let call = 0;
+  const f = await fixture((payload, res) => {
+    const raw = payload.messages.filter(m => m.role === 'user' && typeof m.content === 'string' && m.content.startsWith('连续语音转写快照：')).at(-1)!.content;
+    const snapshot = JSON.parse(raw.slice('连续语音转写快照：'.length));
+    if (++call === 1) replyVoice(res, [{ tool: 'navigate', action: 'add' }], '标题改为');
+    else {
+      assert.equal(snapshot.transcript, '请新增一页标题改为预算');
+      assert.equal('delta' in snapshot, false, 'do not repeat the same demand in a second text field');
+      assert.equal(snapshot.snapshot, true);
+      replyVoice(res, [{ tool: 'update_page', title: '预算', content: '# 预算', layout: 'default' }]);
+    }
+  });
+  try {
+    const input = { session: randomUUID(), seq: 0, start: 0, end: 3, raw: '请新增一页标题改为', endpoint: false, source: 'volc-stream' as const, snapshot: true };
+    f.core.ingestVoice(input); await f.core.waitForIdle();
+    f.core.ingestVoice({ ...input, seq: 1, end: 5, raw: '请新增一页标题改为预算' }); await f.core.waitForIdle();
+    f.core.ingestVoice({ ...input, seq: 2, end: 6, raw: '请新增一页，标题改为预算。', endpoint: true }); await f.core.waitForIdle();
+    assert.equal(call, 2); assert.equal(f.core.snapshot().pages.length, 2);
+    assert.equal(f.core.snapshot().pages[1].title, '预算');
+  } finally { await f.cleanup(); }
+});
+
+test('ASR revision arriving during inference invalidates the obsolete action', async () => {
+  const started = deferred(), release = deferred(); let call = 0;
+  const f = await fixture(async (_payload, res) => {
+    if (++call === 1) { started.resolve(); await release.promise; replyVoice(res, [{ tool: 'update_page', title: '红色', content: '# 红色', layout: 'default' }]); }
+    else replyVoice(res, [{ tool: 'update_page', title: '蓝色', content: '# 蓝色', layout: 'default' }]);
+  });
+  try {
+    const input = { session: randomUUID(), seq: 0, start: 0, end: 3, raw: '把标题改成红色', endpoint: false, source: 'volc-stream' as const, snapshot: true };
+    f.core.ingestVoice(input); await started.promise;
+    f.core.ingestVoice({ ...input, seq: 1, end: 4, raw: '把标题改成蓝色' }); release.resolve();
+    await f.core.waitForIdle();
+    assert.equal(f.core.snapshot().pages[0].title, '蓝色');
+    assert.equal(f.events.some(e => e.type === 'deck' && e.deck.pages.some(p => p.title === '红色')), false);
+  } finally { release.resolve(); await f.cleanup(); }
+});
+
+test('one backend Agent calibrates speech and executes a complete short command in one model call', async () => {
+  const f = await fixture((_payload, res) => replyVoice(res, [{ tool: 'navigate', action: 'add' }]));
+  try {
+    const session = randomUUID();
+    const input = { session, seq: 0, start: 0, end: 2, raw: '请帮我新增一张空白幻灯片', endpoint: true };
+    const receipt = f.core.ingestVoice(input);
+    await f.core.waitForIdle();
+    assert.equal(f.requests.length, 1);
+    assert.equal(f.core.snapshot().pages.length, 2);
+    assert.deepEqual(f.core.ingestVoice(input), receipt);
+    assert.equal(f.requests.length, 1, 'retries must not execute twice');
+    assert.throws(() => f.core.ingestVoice({ ...input, raw: '不同内容' }), /冲突/);
+  } finally { await f.cleanup(); }
+});
+
+test('continuous voice keeps tool history and executes dependent actions sequentially in one inference', async () => {
+  let step = 0;
+  const f = await fixture((payload, res) => {
+    if (++step === 1) replyVoice(res, [{ tool: 'navigate', action: 'add' }], '标题改成');
+    else if (step === 2) {
+      assert.ok(payload.messages.some(message => message.role === 'tool'), 'previous tools persist');
+      replyVoice(res, [{ tool: 'update_page', title: '语音验收', content: '# 语音验收\n\n项目目标是提高效率\n\n项目预算是100万元', layout: 'default' }]);
+    } else replyVoice(res, [
+      { tool: 'edit_page', old_string: '100万元', new_string: '80万元' },
+      { tool: 'delete_page', pages: 'current' },
+    ]);
+  });
+  const session = randomUUID();
+  try {
+    f.core.ingestVoice({ session, seq: 0, start: 0, end: 4, raw: '新增一页标题改成', endpoint: false });
+    await f.core.waitForIdle();
+    assert.equal(f.core.snapshot().pages.length, 2, 'complete action executes during speech');
+    f.core.ingestVoice({ session, seq: 1, start: 2, end: 8, raw: '标题改成语音验收添加目标提高效率和预算100万元', endpoint: false });
+    await f.core.waitForIdle();
+    assert.match(f.core.snapshot().pages[1].content, /100万元/);
+    f.core.ingestVoice({ session, seq: 2, start: 6, end: 12, raw: '预算改80万元然后删除语音验收这一页', endpoint: true });
+    await f.core.waitForIdle();
+    const snapshots = f.events.filter((event): event is Extract<CoreEvent, { type: 'deck' }> => event.type === 'deck');
+    assert.ok(snapshots.some(event => event.deck.pages.some(page => /80万元/.test(page.content))));
+    assert.equal(f.core.snapshot().pages.length, 1);
+    assert.equal(f.requests.length, 3, 'no separate calibration or finish inference');
+    assert.equal(f.events.some(event => event.type === 'tool-skipped' || event.type === 'error'), false);
+  } finally { await f.cleanup(); }
+});
+
+test('a new speech continuation does not cancel an earlier complete action', async () => {
+  const started = deferred(), release = deferred(); let step = 0;
+  const f = await fixture(async (_payload, res) => {
+    if (++step === 1) { started.resolve(); await release.promise; replyVoice(res, [{ tool: 'navigate', action: 'add' }]); }
+    else replyVoice(res, [{ tool: 'update_page', title: '续句', content: '# 续句', layout: 'default' }]);
+  });
+  const session = randomUUID();
+  try {
+    f.core.ingestVoice({ session, seq: 0, start: 0, end: 4, raw: '新增一页', endpoint: false });
+    await started.promise;
+    f.core.ingestVoice({ session, seq: 1, start: 2, end: 8, raw: '标题改为续句', endpoint: true });
+    release.resolve(); await f.core.waitForIdle();
+    assert.equal(f.core.snapshot().pages.length, 2);
+    assert.equal(f.core.snapshot().pages[1].title, '续句');
+    assert.equal(f.events.some(event => event.type === 'tool-skipped'), false);
+  } finally { release.resolve(); await f.cleanup(); }
+});
+
+test('unfinished speech and invented placeholders cannot become visible content', async () => {
+  let step = 0;
+  const f = await fixture((_payload, res) => {
+    if (++step === 1) replyVoice(res, [
+      { tool: 'navigate', action: 'add' },
+      { tool: 'update_page', title: '标题', content: '# 标题\n\n待补充', layout: 'default' },
+    ], '然后');
+    else replyVoice(res, [{ tool: 'update_page', title: '标题', content: '# 标题', layout: 'default' }], '然后');
+  });
+  try {
+    f.core.ingestVoice({ session: randomUUID(), seq: 0, start: 0, end: 4, raw: '新增一页标题为标题然后', endpoint: false });
+    await f.core.waitForIdle();
+    assert.equal(f.core.snapshot().pages.length, 2, 'successful creation is not replayed on correction');
+    assert.equal(f.core.snapshot().pages[1].content, '# 标题');
+    assert.ok(f.events.filter(event => event.type === 'deck').every(event => !JSON.stringify(event.deck).includes('待补充')));
+    assert.equal(f.requests.length, 2);
+  } finally { await f.cleanup(); }
+});
+
+test('a failed dependent action stops the rest of a speech batch until corrected', async () => {
+  let step = 0;
+  const f = await fixture((_payload, res) => {
+    if (++step === 1) replyVoice(res, [
+      { tool: 'navigate', action: 'add' },
+      { tool: 'edit_page', old_string: '不存在的文字', new_string: '预算80万元' },
+      { tool: 'delete_page', pages: 'current' },
+    ]);
+    else replyVoice(res, [
+      { tool: 'update_page', title: '预算', content: '# 预算\n\n80万元', layout: 'default' },
+      { tool: 'delete_page', pages: 'current' },
+    ]);
+  });
+  try {
+    f.core.ingestVoice({ session: randomUUID(), seq: 0, start: 0, end: 4, raw: '新增一页填写预算80万元然后删除该页', endpoint: true });
+    await f.core.waitForIdle();
+    const saved = f.events.filter((event): event is Extract<CoreEvent, { type: 'deck' }> => event.type === 'deck');
+    assert.deepEqual(saved.map(event => event.deck.pages.length), [2, 2, 1]);
+    assert.match(saved[1].deck.pages[1].content, /80万元/);
+    assert.equal(f.requests.length, 2);
+  } finally { await f.cleanup(); }
+});
+
+test('compact voice parameters retain ordered actions and reject a duplicated primary title before writing', async () => {
+  let call = 0;
+  const f = await fixture((_payload, res) => {
+    call++;
+    if (call === 1) reply(res, undefined, undefined, 'apply_voice', { completed: [{ actions: [{ tool: 'update_page', title: '验收', content: '# 验收\n\n项目目标是提高效率', layout: 'default' }] }] });
+    else if (call === 2) replyVoice(res, [{ tool: 'edit_page', old_string: '项目目标是提高效率', new_string: '# 验收\n\n项目目标是提高效率\n项目预算是100万元' }]);
+    else replyVoice(res, [{ tool: 'edit_page', old_string: '项目目标是提高效率', new_string: '项目目标是提高效率\n项目预算是100万元' }]);
+  });
+  try {
+    const session = randomUUID();
+    f.core.ingestVoice({ session, seq: 0, start: 0, end: 3, raw: '标题验收，项目目标是提高效率', endpoint: true });
+    await f.core.waitForIdle();
+    f.core.ingestVoice({ session, seq: 1, start: 3, end: 6, raw: '再添加项目预算是100万元', endpoint: true });
+    await f.core.waitForIdle();
+    assert.equal(call, 3);
+    assert.match(f.core.snapshot().pages[0].content, /项目预算是100万元/);
+    const snapshots = f.events.filter((event): event is Extract<CoreEvent, { type: 'deck' }> => event.type === 'deck');
+    assert.ok(snapshots.every(event => event.deck.pages.every(page => (page.content.match(/^# 验收$/gm) || []).length <= 1)));
+    assert.ok(f.events.some(event => event.type === 'tool-result' && JSON.stringify(event.output).includes('重复了已有主标题')));
   } finally { await f.cleanup(); }
 });

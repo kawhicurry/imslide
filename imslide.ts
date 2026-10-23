@@ -6,10 +6,13 @@
 import 'dotenv/config';
 import { prompts, slideEditorSystemPrompt } from './prompt.ts';
 import express from 'express';
-import { TranscriptMerger, calibrator, mergeSchema } from './src/transcript-merger.ts';
+import { TranscriptMerger, calibrator, mergeSchema, type MergeInput } from './src/transcript-merger.ts';
 import { paragraphText } from './src/paragraphs.ts';
 import { LocalASR } from './src/asr-server.ts';
-import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
+import { attachVolcStream, volcConfiguration, VOLC_RESOURCE } from './src/volc-stream.ts';
+import { appendVoiceText } from './src/voice-text.ts';
+import { voiceTextKey } from './src/voice-snapshot.ts';
+import { mkdir, readFile, writeFile, rename, appendFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { parse as parseYaml } from 'yaml';
@@ -18,6 +21,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { parseSync } from '@slidev/parser';
 import { ToolLoopAgent, tool, stepCountIs, type LanguageModel, type ModelMessage } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
+import { Agent as HttpAgent } from 'undici';
 import { z } from 'zod';
 
 export const pageSchema = z.object({
@@ -25,6 +29,15 @@ export const pageSchema = z.object({
   content: z.string().max(24000).refine(s => !/^---/m.test(s) && !/<\s*\/?\s*(script|iframe|object|embed)\b|\b(?:src|href)\s*=\s*["']?\s*javascript:|\bon\w+\s*=|\{\{|\bv-[\w-]+\s*=|@\w+\s*=/i.test(s), '仅允许单页 Markdown、静态 HTML 和 CSS，不能包含可执行脚本或分页符'),
   layout: z.enum(['default', 'center', 'cover', 'two-cols', 'section', 'image-left', 'image-right']).default('default'),
 });
+const actionSchema = z.discriminatedUnion('tool', [
+  z.object({ tool: z.literal('navigate'), action: z.enum(['next', 'previous', 'goto', 'add']), page: z.number().int().positive().optional() }),
+  pageSchema.omit({ id: true }).extend({ tool: z.literal('update_page'), page: z.number().int().positive().optional() }),
+  z.object({ tool: z.literal('edit_page'), page: z.number().int().positive().optional(), field: z.enum(['content', 'title']).default('content'), old_string: z.string().min(1).max(24000), new_string: z.string().max(24000), replace_all: z.boolean().default(false) }),
+  z.object({ tool: z.literal('delete_page'), pages: z.union([z.number().int().positive(), z.array(z.number().int().positive()).min(1).max(60), z.literal('all'), z.literal('current')]) }),
+  z.object({ tool: z.literal('read_page'), pages: z.union([z.number().int().positive(), z.array(z.number().int().positive()).min(1).max(60), z.literal('all')]) }),
+]);
+export const voicePlanSchema = z.object({ completed: z.array(z.object({ actions: z.array(actionSchema).max(16) })).max(16), pending: z.string().max(4000).default(''), needsFollowUp: z.boolean().default(false) });
+
 export const deckSchema = z.object({
   pages: z.array(pageSchema).min(1).max(60), current: z.number().int().min(0), revision: z.number().int().min(0),
 }).refine(d => d.current < d.pages.length && new Set(d.pages.map(p => p.id)).size === d.pages.length, '页码或页面标识无效');
@@ -162,25 +175,33 @@ export type CoreEvent =
   | { type: 'deck'; deck: Deck }
   | { type: 'accepted' | 'steering-applied' | 'input-failed'; runId: string; messageId: string; error?: string }
   | { type: 'started'; runId: string }
+  | { type: 'model-step'; runId: string; phase: 'start' | 'first-token' | 'finish'; at: number; inputTokens?: number; outputTokens?: number }
+  | { type: 'model-request'; runId: string; replica: number; replicas: number; at: number }
   | { type: 'text'; runId: string; responseId: string; text: string }
-  | { type: 'tool'; runId: string; name: string }
+  | { type: 'tool'; runId: string; name: string; callId: string; input: unknown; at: number }
+  | { type: 'tool-result'; runId: string; name: string; callId: string; output: unknown; at: number }
+  | { type: 'tool-error'; runId: string; name: string; callId: string; error: string; at: number }
   | { type: 'tool-skipped'; runId: string; reason: string }
   | { type: 'done'; runId: string; deck: Deck }
   | { type: 'error'; runId?: string; error: string }
   | { type: 'transcript'; utteranceId: string; text: string; isFinal: boolean; status: string };
-type Instruction = { id: string; text: string };
+type Instruction = { id: string; text: string; voice?: MergeInput };
 type Receipt = { runId: string; messageId: string; mode: 'start' | 'steer' };
-type Run = { id: string; pending: Instruction[]; inputs: Instruction[]; controller: AbortController; completion: Promise<void> };
+type Run = { id: string; pending: Instruction[]; inputs: Instruction[]; controller: AbortController; completion: Promise<void>; voiceSession?: string };
 export type ImSlideOptions = { file?: string; model?: LanguageModel; quietMs?: number; onEvent?: (event: CoreEvent) => void; legacyFile?: string };
 const instructionSchema = z.object({ text: z.string().trim().min(1).max(8000), id: z.string().min(1).max(120) });
 
 
 export class ImSlide {
+  recordModelRequest(replica: number, replicas: number) {
+    if (this.active) this.emit({ type: 'model-request', runId: this.active.id, replica, replicas, at: Date.now() });
+  }
   private deck: Deck;
   private listeners = new Set<(event: CoreEvent) => void>();
   private active?: Run;
   private receipts = new Map<string, Receipt>();
   private history: ModelMessage[][] = [];
+  private voiceSessions = new Map<string, { messages: ModelMessage[]; pending: string; transcript: string; audioEnd: number; lastSeq: number; receipts: Map<number, { fingerprint: string; receipt: Receipt }> }>();
   private writes: Promise<void> = Promise.resolve();
   private closed = false;
   readonly file: string;
@@ -227,7 +248,7 @@ export class ImSlide {
     const fingerprint = JSON.stringify(current);
     const unchanged = known?.get(current.id) === fingerprint;
     return { currentPage: this.deck.current + 1, revision: this.deck.revision,
-      pages: this.deck.pages.map(({ id, title, layout }, index) => ({ page: index + 1, id, title, layout })),
+      pages: this.deck.pages.map(({ title, layout }, index) => ({ page: index + 1, title, layout })),
       ...(unchanged ? { currentContentUnchanged: true } : { currentContent: current.content }) };
   }
   private async save(next: Deck) {
@@ -285,8 +306,57 @@ export class ImSlide {
   }
   /** While running, inject at the next safe model step; do not wait for the full turn. */
   steer(text: string, id: string = randomUUID()): Receipt {
+    return this.enqueueInstruction(text, id);
+  }
+  ingestVoice(raw: MergeInput): Receipt {
+    const input = mergeSchema.parse(raw);
+    if (input.error) throw new Error('语音片段识别失败，未执行；请重新说出完整指令');
+    let session = this.voiceSessions.get(input.session);
+    if (!session) {
+      if (this.voiceSessions.size >= 32) {
+        const oldest = [...this.voiceSessions.keys()].find(id => id !== this.active?.voiceSession);
+        if (oldest) this.voiceSessions.delete(oldest);
+      }
+      session = { messages: [], pending: '', transcript: '', audioEnd: 0, lastSeq: -1, receipts: new Map() };
+      this.voiceSessions.set(input.session, session);
+    }
+    const fingerprint = JSON.stringify(input);
+    const previous = session.receipts.get(input.seq);
+    if (previous) {
+      if (previous.fingerprint !== fingerprint) throw new Error('语音片段编号冲突');
+      return previous.receipt;
+    }
+    if (input.seq <= session.lastSeq) throw new Error('语音片段顺序无效');
+    if (input.snapshot && voiceTextKey(input.raw) === voiceTextKey(session.transcript) && session.lastSeq >= 0) {
+      const receipt = session.receipts.get(session.lastSeq)!.receipt;
+      session.lastSeq = input.seq; session.receipts.set(input.seq, { fingerprint, receipt });
+      return receipt;
+    }
+    if (this.active && this.active.voiceSession !== input.session) throw new Error('其他指令仍在处理，请稍后重试语音片段');
+    if (session.receipts.size >= 128 || JSON.stringify(session.messages).length > 180000) throw new Error('语音会话过长，请结束后开始新录音');
+    let transcript = session.transcript, audioEnd = session.audioEnd;
+    let aligned = true;
+    if (input.snapshot) {
+      // A revised cumulative hypothesis replaces the old one. It is never appended.
+      transcript = input.raw;
+      audioEnd = input.end;
+    } else for (const part of input.segments || [input]) {
+      const joined = appendVoiceText(transcript, part.raw, part.start < audioEnd);
+      transcript = joined.text; aligned &&= joined.aligned;
+      audioEnd = part.end;
+    }
+    const text = '连续语音转写快照：' + JSON.stringify({ session: input.session, seq: input.seq, endpoint: input.endpoint,
+      snapshot: input.snapshot, revised: !!input.snapshot && !voiceTextKey(transcript).startsWith(voiceTextKey(session.transcript)),
+      start: input.start, end: input.end, transcript: transcript.slice(-6000), overlapAligned: aligned });
+    const receipt = this.enqueueInstruction(text, `speech:${input.session}:${input.seq}`, input);
+    session.lastSeq = input.seq;
+    session.transcript = transcript.slice(-12000); session.audioEnd = audioEnd;
+    session.receipts.set(input.seq, { fingerprint, receipt });
+    return receipt;
+  }
+  private enqueueInstruction(text: string, id: string, voice?: MergeInput): Receipt {
     if (this.closed) throw new Error('能力已关闭');
-    const input = instructionSchema.parse({ text, id });
+    const input = (voice ? instructionSchema.extend({ text: z.string().trim().min(1).max(24000) }) : instructionSchema).parse({ text, id });
     const previous = this.receipts.get(id);
     if (previous) return previous;
     if (!this.options.model) throw new Error('尚未配置模型');
@@ -294,10 +364,11 @@ export class ImSlide {
     let run = this.active;
     const mode = run ? 'steer' : 'start';
     if (!run) {
-      run = { id: randomUUID(), pending: [], inputs: [], controller: new AbortController(), completion: Promise.resolve() };
+      run = { id: randomUUID(), pending: [], inputs: [], controller: new AbortController(), completion: Promise.resolve(), voiceSession: voice?.session };
       this.active = run;
     }
-    run.pending.push(input); run.inputs.push(input);
+    const instruction = { ...input, voice };
+    run.pending.push(instruction); run.inputs.push(instruction);
     const receipt: Receipt = { runId: run.id, messageId: id, mode };
     this.receipts.set(id, receipt);
     if (this.receipts.size > 512) this.receipts.delete(this.receipts.keys().next().value!);
@@ -306,26 +377,26 @@ export class ImSlide {
     return receipt;
   }
   private async execute(run: Run): Promise<void> {
-    const timeline: ModelMessage[] = this.history.flat();
+    const voice = run.voiceSession ? this.voiceSessions.get(run.voiceSession) : undefined;
+    const timeline: ModelMessage[] = voice ? [...voice.messages] : this.history.flat();
     const knownPages = new Map<string, string>();
     let finished = false;
     let toolFailed = false;
+    let waiting = false;
     let stepRevision = this.deck.revision;
     let stepSelection = this.selectionVersion;
+    let stepTranscript = voice?.transcript || '';
     const guard = () => {
-      if (run.controller.signal.aborted || run.pending.length || this.deck.revision !== stepRevision || this.selectionVersion !== stepSelection) throw new Error('STEER_REPLAN');
+      if (voice && run.pending.some(input => input.voice?.snapshot) && !voiceTextKey(voice.transcript).startsWith(voiceTextKey(stepTranscript))) throw new Error('STEER_REPLAN');
+      if (run.controller.signal.aborted || run.pending.some(input => !input.voice) || this.deck.revision !== stepRevision || this.selectionVersion !== stepSelection) throw new Error('STEER_REPLAN');
     };
     const skipped = () => {
       toolFailed = true;
       this.emit({ type: 'tool-skipped', runId: run.id, reason: '新指令已确认，旧步骤尚未提交，将按最新指令重新规划' });
       return { skipped: true, reason: 'Replan using latest instruction and state.' };
     };
-    const agent = new ToolLoopAgent({
-      model: this.options.model!, instructions: prompts.slideEditor,
-      // This outer loop owns steering and retains complete tool-call/result pairs.
-      stopWhen: stepCountIs(1), maxRetries: 1, toolChoice: 'required', maxOutputTokens: 4096,
-      prepareStep: () => ({ system: slideEditorSystemPrompt(this.state(knownPages)) }),
-      tools: {
+    const completion = z.boolean().optional();
+    const deckTools = {
         finish: tool({ description: '全部要求已完成或无需操作时结束，不生成文字回复。', inputSchema: z.object({}), execute: async () => {
           try { guard(); finished = true; return { done: true }; }
           catch (error) { if ((error as Error).message === 'STEER_REPLAN') return skipped(); toolFailed = true; throw error; }
@@ -352,7 +423,7 @@ export class ImSlide {
             }
           },
         }),
-        update_page: tool({ description: '完整替换指定页正文、标题和布局；page从1开始，省略时为当前页。不切换当前浏览页。保留未要求修改的内容。', inputSchema: pageSchema.omit({ id: true }).extend({ page: z.number().int().positive().optional(), done: z.boolean().optional() }), execute: async ({ page, done, ...input }) => {
+        update_page: tool({ description: '完整替换指定页正文、标题和布局；page从1开始，省略时为当前页。不切换当前浏览页。保留未要求修改的内容。', inputSchema: pageSchema.omit({ id: true }).extend({ page: z.number().int().positive().optional(), done: completion }), execute: async ({ page, done, ...input }) => {
           try {
             await this.change(current => {
               const next = structuredClone(current);
@@ -374,7 +445,7 @@ export class ImSlide {
             old_string: z.string().min(1).max(24000),
             new_string: z.string().max(24000),
             replace_all: z.boolean().default(false),
-            done: z.boolean().optional(),
+            done: completion,
           }),
           execute: async ({ page, field, old_string, new_string, replace_all, done }) => {
             try {
@@ -405,7 +476,7 @@ export class ImSlide {
         }),
         delete_page: tool({
           description: '删除指定的一页或多页。pages接受从1开始的页码、页码数组，或特殊值all清空整份演示。数组按删除前的页码一次处理，重复页码只删除一次。仅用户明确要求删除或清空时调用；删完后保留一张空白页。',
-          inputSchema: z.object({ pages: z.union([z.number().int().positive(), z.array(z.number().int().positive()).min(1).max(60), z.literal('all')]), done: z.boolean().optional() }),
+          inputSchema: z.object({ pages: z.union([z.number().int().positive(), z.array(z.number().int().positive()).min(1).max(60), z.literal('all')]), done: completion }),
           execute: async ({ pages, done }) => {
             try {
               await this.change(current => deletePages(current, pages), guard, () => { stepRevision = this.deck.revision; stepSelection = this.selectionVersion; });
@@ -415,7 +486,7 @@ export class ImSlide {
             } catch (error) { if ((error as Error).message === 'STEER_REPLAN') return skipped(); toolFailed = true; throw error; }
           },
         }),
-        navigate: tool({ description: '前进、后退、跳至某页，或在当前页后新增空白页。', inputSchema: z.object({ action: z.enum(['next', 'previous', 'goto', 'add']), page: z.number().int().optional(), done: z.boolean().optional() }), execute: async ({ action, page, done }) => {
+        navigate: tool({ description: '用户要求新增一页时用add：在当前页后插入空白页并切换过去。next仅用于下一页（末页时才新增）；previous上一页，goto跳至指定页。', inputSchema: z.object({ action: z.enum(['next', 'previous', 'goto', 'add']), page: z.number().int().optional(), done: completion }), execute: async ({ action, page, done }) => {
           try {
             await this.change(current => navigate(current, action, page), guard, () => { stepRevision = this.deck.revision; stepSelection = this.selectionVersion; });
             stepRevision = this.deck.revision;
@@ -423,7 +494,59 @@ export class ImSlide {
             return { ok: true };
           } catch (error) { if ((error as Error).message === 'STEER_REPLAN') return skipped(); toolFailed = true; throw error; }
         } }),
+    };
+    const voiceTool = tool({
+      description: '校准并依序执行全部新增完整语音指令；未完尾句留pending。需读取后续规划时needsFollowUp=true。参数用紧凑JSON，省略空或false默认字段。',
+      inputSchema: voicePlanSchema,
+      execute: async ({ completed, pending, needsFollowUp }, context) => {
+        const results: Array<{ instruction: string; tool: string; output: unknown }> = [];
+        for (const instruction of completed) {
+          for (const action of instruction.actions) {
+            const { tool: name, ...args } = action;
+            const input = { ...args, done: false, ...('pages' in args && args.pages === 'current' ? { pages: this.deck.current + 1 } : {}) };
+            const callId = `${context.toolCallId}:${results.length}`;
+            this.emit({ type: 'tool', runId: run.id, name, callId, input, at: Date.now() });
+            const execute = deckTools[name].execute as unknown as (input: unknown) => Promise<unknown>;
+            const written = action.tool === 'update_page' ? action.content : action.tool === 'edit_page' ? action.new_string : '';
+            const existing = this.deck.pages[('page' in action && action.page ? action.page - 1 : this.deck.current)]?.content || '';
+            const allowed = (voice?.transcript || '') + existing;
+            const inventedPlaceholder = written.match(/待补充|待完善|待填写|TODO|TBD/gi)?.some(marker => !allowed.includes(marker));
+            const clean = (text: string) => text.replace(/<[^>]*>/g, '').replace(/[\p{P}\p{S}\s]/gu, '');
+            const lastLine = clean(written.trim().split('\n').at(-1) || '');
+            const copiedTail = pending && lastLine.length >= 4 && clean(pending).endsWith(lastLine);
+            const proposed = action.tool === 'edit_page' && action.field !== 'title'
+              ? (action.replace_all ? existing.split(action.old_string).join(action.new_string) : existing.replace(action.old_string, () => action.new_string))
+              : action.tool === 'update_page' ? action.content : existing;
+            const headings = (text: string) => [...text.matchAll(/^#\s+(.+)$/gm)].map(match => clean(match[1]));
+            const beforeHeadings = headings(existing), afterHeadings = headings(proposed);
+            const duplicatedTitle = afterHeadings.some(title => title && afterHeadings.filter(value => value === title).length > Math.max(1, beforeHeadings.filter(value => value === title).length));
+            const output = duplicatedTitle
+              ? { ok: false, error: '局部替换重复了已有主标题，未写入。new_string只替换old_string范围；整页重写用update_page。保留单个主标题并重试此步，成功前序动作不重放。' }
+              : inventedPlaceholder || copiedTail
+              ? { ok: false, error: '不能把未要求的占位词或待确认尾句写入页面。只写完整内容，未完原话留在pending；此前成功动作不要重复。' }
+              : await execute(input);
+            results.push({ instruction: `完整指令${completed.indexOf(instruction) + 1}`, tool: name, output });
+            this.emit({ type: 'tool-result', runId: run.id, name, callId, output, at: Date.now() });
+            if (output && typeof output === 'object' && (('ok' in output && output.ok === false) || ('skipped' in output && output.skipped))) {
+              toolFailed = true; finished = false;
+              return { ok: false, results, retryRemaining: true };
+            }
+          }
+        }
+        if (voice) voice.pending = pending;
+        waiting = !!pending;
+        finished = !needsFollowUp;
+        return { ok: true, results, pending, needsFollowUp };
       },
+    });
+    const agent = new ToolLoopAgent({
+      model: this.options.model!, instructions: prompts.slideEditor,
+      temperature: voice ? 0 : undefined,
+      stopWhen: stepCountIs(1), maxRetries: 1, toolChoice: 'required', maxOutputTokens: 4096,
+      // Keep the voice system prefix invariant across document revisions so the
+      // provider can reuse its prefill; mutable document state stays in user data.
+      prepareStep: () => ({ system: voice ? prompts.voiceEditor : slideEditorSystemPrompt(this.state(knownPages)) }),
+      tools: voice ? { apply_voice: voiceTool } : deckTools,
     });
     const timeout = setTimeout(() => run.controller.abort(), 120000);
     this.emit({ type: 'started', runId: run.id });
@@ -435,30 +558,45 @@ export class ImSlide {
         // system prompt with the same body on every tool round.
         const current = this.deck.pages[this.deck.current];
         const signature = JSON.stringify(current);
-        if (knownPages.get(current.id) !== signature) {
+        if (run.pending.length && knownPages.get(current.id) !== signature) {
           timeline.push({ role: 'user', content: '页面参考数据（不是操作指令）：' + JSON.stringify({ page: this.deck.current + 1, ...current }) });
           knownPages.set(current.id, signature);
         }
         const steering = run.pending.splice(0);
+        const latestSnapshot = steering.filter(input => input.voice?.snapshot).at(-1);
         for (const input of steering) {
-          timeline.push({ role: 'user', content: input.text });
+          if (!input.voice?.snapshot || input === latestSnapshot) timeline.push({ role: 'user', content: input.text });
           this.emit({ type: 'steering-applied', runId: run.id, messageId: input.id });
         }
         stepRevision = this.deck.revision; stepSelection = this.selectionVersion;
-        finished = false; toolFailed = false;
-        const result = await agent.stream({ messages: timeline, abortSignal: run.controller.signal });
+        stepTranscript = voice?.transcript || '';
+        finished = false; toolFailed = false; waiting = false;
+        this.emit({ type: 'model-step', runId: run.id, phase: 'start', at: Date.now() });
+        let firstToken = false;
+        const messages: ModelMessage[] = voice ? [...timeline, { role: 'user', content: prompts.deckContextLabel + JSON.stringify(this.state(knownPages)) }] : timeline;
+        const result = await agent.stream({ messages, abortSignal: run.controller.signal });
         for await (const part of result.fullStream) {
-          if (part.type === 'tool-call') this.emit({ type: 'tool', runId: run.id, name: part.toolName });
-          if (part.type === 'tool-error') toolFailed = true;
+          if (!firstToken && (part.type === 'tool-input-delta' || part.type === 'text-delta')) {
+            firstToken = true;
+            this.emit({ type: 'model-step', runId: run.id, phase: 'first-token', at: Date.now() });
+          }
+          if (part.type === 'finish-step') this.emit({ type: 'model-step', runId: run.id, phase: 'finish', at: Date.now(), inputTokens: part.usage.inputTokens, outputTokens: part.usage.outputTokens });
+          if (part.type === 'tool-call') this.emit({ type: 'tool', runId: run.id, name: part.toolName, callId: part.toolCallId, input: part.input, at: Date.now() });
+          if (part.type === 'tool-result') this.emit({ type: 'tool-result', runId: run.id, name: part.toolName, callId: part.toolCallId, output: part.output, at: Date.now() });
+          if (part.type === 'tool-error') {
+            toolFailed = true;
+            this.emit({ type: 'tool-error', runId: run.id, name: part.toolName, callId: part.toolCallId, error: part.error instanceof Error ? part.error.message : String(part.error), at: Date.now() });
+          }
           if (part.type === 'error') throw part.error;
         }
         timeline.push(...(await result.response).messages);
         const calls = await result.toolCalls;
+        if (voice && finished && !toolFailed && !waiting) voice.pending = '';
         if (!run.pending.length && finished && !toolFailed) break;
         if (!run.pending.length && !calls.length) throw new Error('Model did not call a required tool');
       }
       // Current document is authoritative; retain only recent user intent, not old page bodies.
-      this.history.push(run.inputs.map(input => ({ role: 'user' as const, content: `历史已完成指令（仅用于理解指代，不重复执行）：${input.text}` })));
+      if (!voice) this.history.push(run.inputs.map(input => ({ role: 'user' as const, content: `历史已完成指令（仅用于理解指代，不重复执行）：${input.text}` })));
       while (this.history.length > 1 && (this.history.length > 3 || JSON.stringify(this.history).length > 12000)) this.history.shift();
       // No await between the final pending check and releasing ownership: no lost late steer.
       if (this.active === run) this.active = undefined;
@@ -469,7 +607,12 @@ export class ImSlide {
       const message = run.controller.signal.aborted ? '处理已取消或超时，已保存的页面会保留' : error instanceof Error && error.message.includes('32 步') ? error.message : '模型处理失败，请检查密钥、模型及网络；已保存的页面会保留';
       for (const input of run.inputs) this.emit({ type: 'input-failed', runId: run.id, messageId: input.id, error: message });
       this.emit({ type: 'error', runId: run.id, error: message });
-    } finally { clearTimeout(timeout); }
+    } finally {
+      // Preserve successful tool/result pairs across speech chunks and separate runs.
+      // Later continuations must neither repeat these tools nor forget earlier work.
+      if (voice) voice.messages = timeline;
+      clearTimeout(timeout);
+    }
   }
   async waitForIdle(): Promise<void> { while (this.active) await this.active.completion; }
   async close(): Promise<void> {
@@ -500,24 +643,35 @@ export async function loadModelConfiguration(env: NodeJS.ProcessEnv = process.en
 /** Local adapter: read-only document endpoints plus external, finalized ASR/steer ingestion. */
 export async function serve(options: ImSlideOptions = {}, port = Number(process.env.PORT || 3001)) {
   const configuration = options.model ? undefined : await loadModelConfiguration();
+  let core: ImSlide;
+  const modelConnections = configuration?.apiKey ? new HttpAgent({ keepAliveTimeout: 60000, keepAliveMaxTimeout: 600000 }) : undefined;
   const model = options.model ?? (configuration?.apiKey ? createOpenAI({
     apiKey: configuration.apiKey, baseURL: configuration.baseURL,
     // DeepSeek requires non-thinking mode for forced tool calls.
     fetch: async (input, init) => {
       if (typeof init?.body === 'string') {
         const body = JSON.parse(init.body);
-        if (new URL(configuration.baseURL || 'https://api.openai.com/v1').hostname === 'api.deepseek.com') body.thinking = { type: 'disabled' };
+        const hostname = new URL(configuration.baseURL || 'https://api.openai.com/v1').hostname;
+        if (hostname === 'api.deepseek.com') body.thinking = { type: 'disabled' };
+        else if (hostname === 'ark.cn-beijing.volces.com' && configuration.enableThinking !== undefined) body.thinking = { type: configuration.enableThinking ? 'enabled' : 'disabled' };
         else if (configuration.enableThinking !== undefined) body.enable_thinking = configuration.enableThinking;
-        return fetch(input, { ...init, body: JSON.stringify(body) });
+        const request = { ...init, body: JSON.stringify(body), dispatcher: modelConnections } as RequestInit;
+        core?.recordModelRequest(0, 1);
+        return fetch(input, request);
       }
-      return fetch(input, init);
+      return fetch(input, { ...init, dispatcher: modelConnections } as RequestInit);
     },
   }).chat(configuration.model) : undefined);
-  const core = await ImSlide.open({ ...options, model });
+  core = await ImSlide.open({ ...options, model });
   const app = express();
   const asr = new LocalASR();
   app.get('/api/asr/status', async (_req, res) => {
-    try { await asr.warmup(); res.json({ ready: true, local: true }); }
+    if (asr.provider === 'volc') {
+      try { volcConfiguration(); res.json({ ready: true, local: false, provider: 'volc', mode: 'streaming', resource: VOLC_RESOURCE }); }
+      catch (error) { res.status(503).json({ error: (error as Error).message }); }
+      return;
+    }
+    try { await asr.warmup(); res.json({ ready: true, local: asr.provider === 'whisper', provider: asr.provider }); }
     catch (error) { res.status(503).json({ error: (error as Error).message }); }
   });
   app.post('/api/asr', express.raw({ type: 'application/octet-stream', limit: '1536kb' }), async (req, res) => {
@@ -527,6 +681,20 @@ export async function serve(options: ImSlideOptions = {}, port = Number(process.
     } catch (error) { res.status(503).json({ error: (error as Error).message }); }
   });
   app.use(express.json({ limit: '64kb' }));
+  app.post('/api/voice', async (req, res) => {
+    try {
+      const input = mergeSchema.parse(req.body);
+      if (!input.error && (input.segments || [input]).every(part => !part.raw.trim())) {
+        res.json({ append: '', pending: '', breakBefore: false, skipped: 'no-speech' });
+        return;
+      }
+      const receipt = core.ingestVoice(input);
+      const directory = resolve('.data/transcripts');
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await appendFile(resolve(directory, `voice-${input.session}.jsonl`), JSON.stringify({ ...input, receipt, at: new Date().toISOString() }) + '\n', { mode: 0o600 });
+      res.status(202).json({ append: input.raw, pending: '', breakBefore: false, receipt });
+    } catch (error) { res.status(503).json({ error: (error as Error).message }); }
+  });
   const merger = model ? new TranscriptMerger(resolve('.data/transcripts'), calibrator(model)) : undefined;
   app.post('/api/asr/merge', async (req, res) => {
     try {
@@ -542,9 +710,9 @@ export async function serve(options: ImSlideOptions = {}, port = Number(process.
     } catch (error) { res.status(503).json({ error: (error as Error).message }); }
   });
   app.get('/api/deck', (_req, res) => res.json(core.snapshot()));
-  app.get('/api/status', (_req, res) => res.json({ configured: core.configured, model: configuration?.model ?? 'custom', running: core.running, mode: 'steer', manualEditing: false }));
+  app.get('/api/status', (_req, res) => res.json({ configured: core.configured, model: configuration?.model ?? 'custom', voiceModelReplicas: 1, running: core.running, mode: 'steer', manualEditing: false }));
   app.get('/api/preview-health', async (_req, res) => {
-    try { res.json({ ready: (await fetch('http://127.0.0.1:3030/', { signal: AbortSignal.timeout(1500) })).ok }); }
+    try { res.json({ ready: (await fetch(`http://127.0.0.1:${Number(process.env.SLIDEV_PORT || 3030)}/`, { signal: AbortSignal.timeout(1500) })).ok }); }
     catch { res.json({ ready: false }); }
   });
   app.post('/api/view', async (req, res) => {
@@ -587,7 +755,8 @@ export async function serve(options: ImSlideOptions = {}, port = Number(process.
   app.use((_req, res) => res.status(404).json({ error: '不支持手动修改文稿，请通过 /api/chat 或 /api/input 与 Agent 交互' }));
   app.use((_err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => res.status(400).json({ error: '请求格式无效或过大' }));
   const server = app.listen(port, '127.0.0.1');
-  server.once('close', () => asr.close());
+  attachVolcStream(server);
+  server.once('close', () => { asr.close(); void modelConnections?.close(); });
   return { core, server };
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url) && process.argv.includes('--serve')) {

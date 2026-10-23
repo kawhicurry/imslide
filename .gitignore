@@ -9,3 +9,7 @@ dist/
 slides/slides.md
 slides/.slidev/
 *.log
+
+# Python runtime caches
+__pycache__/
+*.py[cod]

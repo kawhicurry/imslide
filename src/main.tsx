@@ -3,15 +3,22 @@ import { createRoot } from 'react-dom/client';
 import { ArrowUp, ChevronLeft, ChevronRight, Layers, Maximize2, Mic, Radio, Keyboard, Square } from 'lucide-react';
 import type { Deck, CoreEvent } from '../imslide';
 import { OverlapVoiceInput } from './overlap-voice';
+import { StreamingVoiceInput } from './streaming-voice';
+import { advanceSlideCache } from './blank-slide';
 import type { RenderFailure } from './render-error';
 import { SlideCache, type CachedSlide } from './SlideCache';
+import { SlideThumbnail } from './SlideThumbnail';
+import { thumbnailQueue } from './thumbnail-queue';
 import type { TranscriptView as TranscriptState } from './transcript';
 import './style.css';
+import { ToolActivity } from './ToolActivity';
+import { reduceToolActivity, type ToolActivity as ToolActivityState, toolLabels } from './tool-activity';
 
 type ChatMessage = { id: string; role: 'user' | 'assistant'; text: string; status?: 'sending' | 'accepted' | 'processing' | 'done' | 'failed'; runId?: string; breakBefore?: boolean; formatted?: string };
 
 function App() {
   const [deck, setDeck] = useState<Deck>();
+  const receivedDeck = useRef<Deck | undefined>(undefined);
   const [navigating, setNavigating] = useState(false);
   const [rendered, setRendered] = useState<{ pageId: string; revision: number; page: number; total: number }>();
   const [connected, setConnected] = useState(false);
@@ -30,7 +37,8 @@ function App() {
   const [listening, setListening] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptState>({ fixed: '', pending: '', processing: false });
   const [activity, setActivity] = useState('');
-  const voice = useRef<OverlapVoiceInput | undefined>(undefined);
+  const [toolActivity, setToolActivity] = useState<ToolActivityState[]>([]);
+  const voice = useRef<OverlapVoiceInput | StreamingVoiceInput | undefined>(undefined);
   const outgoing = useRef<Promise<void>>(Promise.resolve());
   const chatEnd = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLDivElement>(null);
@@ -48,7 +56,12 @@ function App() {
     setRendered(slide);
     setRenderError(current => current && slide.revision >= current.revision && (!current.pageId || current.pageId === slide.pageId) ? undefined : current);
   }, []);
-  function receiveDeck(next: Deck) { setDeck(current => !current || next.revision >= current.revision ? next : current); }
+  function receiveDeck(next: Deck) {
+    const previous = receivedDeck.current;
+    if (previous && next.revision < previous.revision) return;
+    receivedDeck.current = next; setDeck(next);
+    setCachedSlides(current => advanceSlideCache(current, previous, next));
+  }
   function syncFrame() {
     if (deck && page) frame.current?.contentWindow?.postMessage({ type: 'imslide:navigate', pageId: page.id, revision: deck.revision }, previewOrigin);
   }
@@ -110,10 +123,12 @@ function App() {
       stream.onerror = () => {
         if (stopped) return;
         setConnected(false); stream.close();
+        setToolActivity(items => reduceToolActivity(items, { type: 'disconnected' }));
         reconnectTimer = setTimeout(connect, 1500);
       };
       stream.onmessage = message => {
         const event: CoreEvent = JSON.parse(message.data);
+        setToolActivity(items => reduceToolActivity(items, event));
         if (event.type === 'deck' || event.type === 'done') receiveDeck(event.deck);
         if (event.type === 'started' || event.type === 'accepted') { setRunning(true); setError(''); }
         if (event.type === 'done' || (event.type === 'error' && event.runId)) setRunning(false);
@@ -126,7 +141,7 @@ function App() {
           const existing = items.find(item => item.id === event.responseId);
           return existing ? items.map(item => item.id === event.responseId ? { ...item, text: item.text + event.text } : item) : [...items, { id: event.responseId, role: 'assistant', text: event.text, runId: event.runId }];
         });
-        if (event.type === 'tool') setActivity(event.name === 'navigate' ? 'Agent 正在切换页面…' : event.name === 'delete_page' ? 'Agent 正在删除页面…' : 'Agent 正在更新页面…');
+        if (event.type === 'tool') setActivity(`正在${toolLabels[event.name] || event.name}…`);
         if (event.type === 'tool-skipped') setActivity('收到新要求，正在调整当前步骤…');
         if (event.type === 'input-failed') setMessages(items => items.map(item => item.id === event.messageId ? { ...item, status: 'failed' } : item));
         if (event.type === 'done') { setActivity(''); setMessages(items => items.map(item => item.role === 'user' && item.runId === event.runId ? { ...item, status: 'done' } : item)); }
@@ -137,12 +152,13 @@ function App() {
   }, []);
   useEffect(() => () => voice.current?.dispose(), []);
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }, [messages, activity, transcript]);
-  async function submit(text: string, utteranceId?: string, breakBefore?: boolean) {
+  async function submit(text: string, utteranceId?: string, breakBefore?: boolean, accepted?: { runId: string; messageId: string }) {
     const trimmed = text.trim();
     if (!trimmed) return;
     const id = utteranceId ? `speech:${utteranceId}` : crypto.randomUUID();
     setError('');
-    setMessages(items => [...items, { id, role: 'user', text: trimmed, status: 'sending', breakBefore }]);
+    setMessages(items => [...items, { id, role: 'user', text: trimmed, status: accepted ? 'accepted' : 'sending', runId: accepted?.runId, breakBefore }]);
+    if (accepted) return; // /api/voice already submitted this chunk to the backend Agent.
     // Serialize transport acknowledgments only. Never wait for an Agent run to finish.
     const task = outgoing.current.then(async () => {
       try {
@@ -169,10 +185,15 @@ function App() {
     outgoing.current = task;
     await task;
   }
-  function toggleVoice() {
+  async function toggleVoice() {
     if (listening) { voice.current?.stop(); return; }
     if (!voice.current) {
-      voice.current = new OverlapVoiceInput({ onTranscript: setTranscript, onListening: setListening, onError: setError, onSentence: (id, text, breakBefore) => { void submit(text, id, breakBefore); } });
+      try {
+        const status = await fetch('/api/asr/status').then(response => response.json());
+        if (!status.ready) throw new Error(status.error || '语音服务不可用');
+        const Voice = status.provider === 'volc' ? StreamingVoiceInput : OverlapVoiceInput;
+        voice.current ??= new Voice({ onTranscript: setTranscript, onListening: setListening, onError: setError, onSentence: (id, text, breakBefore, receipt) => { void submit(text, id, breakBefore, receipt); } });
+      } catch (error) { setError((error as Error).message); return; }
     }
     setError(''); voice.current.start();
   }
@@ -207,8 +228,8 @@ function App() {
     </header>
     <div className="workspace">
       <aside className="sidebar"><div className="section-label">幻灯片 <span>{deck?.pages.length.toString().padStart(2, '0') || '—'}</span></div>
-        <div className="page-list">{deck?.pages.map((p, i) => <button key={p.id} disabled={navigating} className={`page-item ${i === index ? 'selected' : ''}`} onClick={() => view(i)} aria-label={`查看第 ${i + 1} 页：${p.title}`}>
-          <span className="page-index">{String(i + 1).padStart(2, '0')}</span><span className="thumbnail">{p.content ? <span className="thumbnail-content"><strong>{p.title}</strong><span>{p.content.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '').replace(/<[^>]*>/g, '').replace(/[#*`]/g, '').slice(0, 110)}</span></span> : <span className="thumbnail-blank"/>}</span><span className="page-title">{p.title}</span>{i === deck.current && <span className="agent-page">AGENT</span>}
+        <div className="page-list" onScroll={() => thumbnailQueue.pause()} onWheel={() => thumbnailQueue.pause()} onPointerDown={() => thumbnailQueue.pause()}>{deck?.pages.map((p, i) => <button key={p.id} disabled={navigating} className={`page-item ${i === index ? 'selected' : ''}`} onClick={() => view(i)} aria-label={`查看第 ${i + 1} 页：${p.title}`}>
+          <span className="page-index">{String(i + 1).padStart(2, '0')}</span><SlideThumbnail slide={cachedSlides.find(slide => slide.pageId === p.id)}/><span className="page-title">{p.title}</span>{i === deck.current && <span className="agent-page">AGENT</span>}
         </button>)}</div>
         <div className="sidebar-footer"><Layers size={10}/> SLIDEV ENGINE</div>
       </aside>
@@ -231,7 +252,10 @@ function App() {
           </div>
           <div ref={chatEnd}/>
         </div>
+        <ToolActivity items={toolActivity} running={running} connected={connected}/>
         <div className="composer-area">
+          {error && <div className="error" role="alert">{error}</div>}
+          {running && connected && <div className="activity" role="status"><i/>{activity || '正在处理指令…'}</div>}
           {inputMode === 'voice' ? <div className="voice-controls">
             <button type="button" className={`voice-orb ${listening ? 'active' : ''}`} onClick={toggleVoice} aria-label={listening ? '停止语音输入' : '开始语音输入'} aria-pressed={listening}>{listening ? <Square size={23} fill="currentColor"/> : <Mic size={30}/>}</button>
             <button type="button" className="input-mode-switch" onClick={() => { void voice.current?.stop(); setInputMode('text'); }} aria-label="切换到文字输入"><Keyboard size={19}/></button>

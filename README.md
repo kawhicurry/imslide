@@ -67,9 +67,9 @@ await slides.close();
 
 ## 语音输入与外部识别接入
 
-前端使用 AudioWorklet 连续采集 PCM，每 4 秒新增音频提交一次，携带前 2 秒重叠：窗口依次为 0–4、2–8、6–12 秒。录音与请求异步运行，不再等待文字连续两次一致，也不会因 24 秒未稳定而停录。本机 Whisper 工作进程排队识别，慢请求不会阻止继续采集。
+前端使用 AudioWorklet 连续采集 PCM，按 20ms 音量帧检测讲话，400ms 停顿确认一句；连续讲话以每 4 秒新增音频、前 2 秒重叠作为兜底。160ms 短停顿时可提前请求后端 ASR，400ms 确认后复用完全相同音频的结果，继续讲话时废弃旧预识别。预识别不会提前校准或执行。录音、识别与校准异步衔接，ASR 请求单路执行；前后端队列均有上限，前端过载会明确暂停录音，不静默丢弃音频。Agent 和所有模型推理均在后端。
 
-识别结果按录音顺序交给配置的 LLM，仅带最近已写入的 128 个 Unicode 字符作为上下文，通过工具调用校正同音错字、去除口吃和重叠重复，追加合并。音频留在本机；原始转写及上下文会发送给已配置模型。校准后的文字显示实字并提交文稿 Agent；等待校准的原始文字显示虚字。校准不能保证消除所有误识别。
+识别片段按录音顺序通过 `/api/voice` 交给后端 Agent，同一轮推理完成校准、完整性判断和工具计划，不再请求独立校准模型。物理重叠窗口的可靠文字后缀/前缀被对齐为累计快照；无法可靠对齐时保留原文，由模型结合成功工具历史判断。默认 MOSS 模式将音频发送至配置的 SSH 主机，可显式选择本机 Whisper。界面转写保留识别原文；实际操作以 Agent 的结构化指令和工具结果为准。
 
 点击停止会提交最后不足 4 秒的尾段并等待队列完成。失败片段提示错误，后续片段继续；校准失败的文字保留虚字且不执行。请求重试使用同一会话和片段编号，避免重复追加。原始转写、128 字上下文、校准追加内容及时间按会话记录在本机 `.data/transcripts/*.jsonl`（权限 600），不保存音频。服务重启后可从日志恢复合并上下文和去重结果。
 
@@ -82,7 +82,7 @@ python3 -m venv .data/asr-venv
 # .env 中设置 ASR_PYTHON 为该 Python 的绝对路径，ASR_MODEL=base
 ```
 
-运行时只加载本地模型缓存（也可把 `ASR_MODEL` 设为本机 CTranslate2 模型目录），不自动下载。依赖缺失会明确提示，文字输入仍可使用。`GET /api/asr/status` 预热模型，`POST /api/asr` 接受最长 24 秒的 16kHz 单声道 Float32 PCM，返回带时间戳的识别词。浏览器需要麦克风权限和 AudioWorklet 支持。
+Whisper 模式只加载本地模型缓存（也可把 `ASR_MODEL` 设为本机 CTranslate2 模型目录），不自动下载。依赖缺失会明确提示，文字输入仍可使用。`GET /api/asr/status` 预热识别服务，`POST /api/asr` 接受最长 24 秒的 16kHz 单声道 Float32 PCM，MOSS 返回文字，Whisper 返回识别词；响应的 `timing` 分别记录服务端排队、处理与总耗时。浏览器需要麦克风权限和 AudioWorklet 支持。
 
 文字输入和已定稿的语音均可在 Agent 运行中继续发送，传输只等待接收确认，不等待上一轮完成，运行中进入同一个 run 的 steer 处理。工具执行与文稿更新通过 SSE 实时显示，模型不再发送文本回复。
 
@@ -208,8 +208,55 @@ Agent 允许单次响应产生多个工具调用，沿用 AI SDK 默认执行调
 
 每页 Markdown 使用内容指纹，修改一页不会改写其他页的版本字段。首次预加载全部页，此后仅对内容、布局、顺序或全局视觉配置变化的页生成快照；传输只包含变化页及目录。未变化页更新目录元数据并复用原 iframe。图片、字体只在前台待替换 iframe 检查一次，加载失败保留旧画面。
 
-静音优化仅检测每个窗口的新增音频（20ms 帧、低阈值），排除重叠区；保留一次语音后的收尾窗口，连续静音不请求ASR。校准忙碌时，已完成识别且尚未开始校准的连续片段最多4片、24秒合并调用一次，保留每片原文和时间戳用于去重，不等待凑批、不丢弃新增文字。弱于检测阈值的声音仍可能漏检，需要人工现场调整。
+静音通过采集时的20ms帧低阈值检测，400ms停顿即提交收尾片段，连续静音不请求ASR。校准忙碌时，已完成识别且尚未开始校准的连续片段最多4片、24秒合并调用一次，保留每片原文和时间戳用于去重，不等待凑批、不丢弃新增文字。弱于检测阈值的声音仍可能漏检，需要人工现场调整。
 
 Agent 每轮只把新读到或变化的正文加入上下文一次，未变化时返回unchanged标记。优先使用edit_page和按需read_page。update_page/edit_page/delete_page/navigate可带done:true，整批成功且无新指令时直接结束，省去单独请求finish的一轮；finish保留用于无需修改的情形。工具执行继续遵循SDK默认行为。
 
 前端拒收旧版本预览，每页仅保留已显示版与最新待就绪版，后来的更新替换未展示的中间版；旧画面保持到最新版成功就绪。
+
+### 当前语音模式：MOSS + LLM 工具执行
+
+默认 `ASR_PROVIDER=moss`、`MOSS_SSH_HOST=157`、`MOSS_BASE_URL=http://127.0.0.1:18768`（地址由远端SSH主机访问）。本机通过持久 SSH 连接访问参考部署中的 MOSS-Audio-4B-Instruct 服务（远端 `127.0.0.1:18768`，沿用 balanced 档），将 16kHz PCM 转为临时 WAV 后调用 `/infer`，只要求返回讲话原文。临时音频在请求结束后删除；音频会发送到该 SSH 主机。需要本机已有可无交互登录的 SSH 配置。
+
+语音检测到约400ms停顿立即提交识别，不等待固定4秒；连续讲话每4秒提交一次，保留2秒重叠。静音不持续请求，保留200ms起始音频。端点检测使用20ms音量帧和低阈值，实际断句需人工试听，噪声或轻声可能影响端点。
+
+所有识别结果统一交给后端Agent，没有关键词动作直通。模型同轮返回 `apply_voice({ completed: [{ instruction, actions }], pending, needsFollowUp })`：完整指令立即执行，未完尾句等待下一片；连续讲话不再强制等到停顿。后端按列表顺序逐项执行，所以新增后填写、预算修改后删行等依赖动作可以同一推理计划完成，并保留各中间状态。读取结果后才能决定参数时才继续下一轮。成功动作及结果在录音会话内保留，新语音是顺序续接，不会像普通文本steer那样废弃旧步骤。每个session/seq幂等，冲突重试报错；新说的真实重复要求仍可执行。
+
+当前远端接口返回完整文本，不是原生流式ASR。延迟包括ASR和合并后的Agent，不承诺固定响应时长；内置语音流程不调用旧 `/api/asr/merge` 校准接口。识别失败明确报错，不自动回退到Whisper。若需要旧识别器可显式设 `ASR_PROVIDER=whisper`。
+
+分段细节：麦克风每40ms交付一次音频，按20ms帧检测。起声仍需连续60ms达到0.001 RMS，进入讲话后使用0.0006阈值保留较轻尾音。400ms停顿确认后只保留160ms尾部静音送识别；若4秒边界已经进入静音，先等待停顿判定（额外等待小于400ms），避免立刻拆成定时片段和尾片。缓冲区复用，避免每帧复制整段音频。LLM合并按录音session串行，不同session不再共用等待队列；工具调用规则不变。以上是实现参数，尚未做现场效果验证。
+
+参考 [memora 的持续音频会话和有界队列设计](https://github.com/MaxtuneLee/memora/blob/3e27e7dee9b7d01c1081c5f820e81266812a074c/docs/adr/0004-nemotron-joins-local-model-runtime-with-streaming-asr-protocol.md)，当前保持后端 MOSS 推理和持久 SSH 连接，不引入浏览器模型。MOSS 仍按完整音频片段推理，没有 Nemotron 的跨块编码器缓存。前端最多保留 6 个待校准片段；后端最多接收 6 个在途/排队 ASR 请求，超限明确报错。页面快照以 80ms 合并更新并检查真实 DOM 就绪，加载失败仍保留旧画面。
+
+端到端测试：`node scripts/test-voice-latency.mjs <audio.wav>`（需安装 Playwright，或通过 `PLAYWRIGHT_MODULE` 指定其模块路径）。可用 `VOICE_LATENCY_OUTPUT` 指定每次证据目录。脚本播放音频进入虚拟麦克风，调用真实 ASR、校准模型和 Agent，验证恰好新增一页并等待该页 ID 和版本实际可见；它会修改当前文稿。`result.json` 包含阶段耗时、完整事件和成功/失败状态，失败结果同样保留。此测试不覆盖物理麦克风和环境噪声。
+
+
+### 无讲话音频拦截
+
+MOSS 转写前，`scripts/moss-worker.py` 使用本机 faster-whisper 自带的 Silero ONNX 模型检测人声（阈值 0.5、最短人声 100ms）。无讲话片段返回空文本和 `speechDetected: false`，不会发送到远端 MOSS；前端与 `/api/voice` 都跳过空转写，不触发编辑 Agent。检测只负责放行，原始语音不被裁剪；没有对英文短语做黑名单过滤。
+
+MOSS 模式也需要先安装 `scripts/asr-requirements.txt`，但不需要下载 Whisper 模型。默认使用 `.data/asr-venv/bin/python`，可通过 `ASR_PYTHON` 覆盖。VAD 依赖缺失会明确报错，不会绕过检测。前端音量阈值仍用于快速分片，最终以服务端人声检测为准。人声检测仍可能误判，真实麦克风环境需现场验证。
+
+### 合并后的语音决策与验收
+
+语音使用温度0的后端模型。累计快照优先于旧pending，避免把重叠片段重复拼成难理解的半句。后端拒绝把待确认尾句或未要求的“待补充/TODO”等占位文本写进页面；遇到错误停止当前批次后续动作，由同一Agent修正，成功前缀不重做。普通文字steer继续保留旧操作失效保护。会话历史和接收去重在当前进程内有效，原始片段与receipt写入 `.data/transcripts/voice-<session>.jsonl`；不承诺崩溃后自动重放操作。
+
+真正空白的default页复用预先加载的单个规范空白文档，仅在后端确认空内容后切换真实页ID和版本，再由Slidev刷新；有正文或其他布局的页继续等待真实编译与资源就绪，不能把空白页的延迟外推为整页生成延迟。
+
+短指令验收：`PLAYWRIGHT_MODULE=<模块路径> VOICE_LATENCY_OUTPUT=<证据目录> node scripts/test-voice-latency.mjs .data/voice-latency/add-page-clear.wav`。测试要求恰好新增一页、实际可见、独立校准为0次、Agent轮数为1次；必须播完录音并等待云端确认后仍无额外修改。`VOICE_VISIBLE_BUDGET_MS=1000` 可把说完到可见低于1秒作为硬门槛，结果另记录实际物理模型请求数。
+
+### 火山 SeedASR 持续双流
+
+设置 `ASR_PROVIDER=volc`、`VOLC_ASR_API_KEY`（或仅含密钥的私有 UTF-8 文件路径 `VOLC_ASR_API_KEY_FILE`），重启后端后刷新网页。默认连接 `wss://openspeech.bytedance.com/api/v3/plan/sauc/bigmodel_async`，资源固定为 `volc.seedasr.sauc.duration`，使用 Agent Plan 专属密钥。普通语音服务密钥需显式设置 `VOLC_ASR_ENDPOINT=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`。密钥仅由后端读取，浏览器只连接同源 `/api/asr/stream`。
+
+该模式持续发送16kHz单声道音频，80ms仅为网络传输包，不裁剪、分段或重启云端音频流。临时文本实时显示；连续两次识别一致的前缀中，遇到逗号、句末标点或“然后”“第二行”等后续语句边界，便将累计转写交给后台语音Agent判断完整要求。无标点但重复稳定的假设也可交付。约80ms本地能量静音且云端消费水位已接近末次有声采样（最多一包80ms时间量化误差）时，提前交付最新文字；该提示不表示语义完整，仍由LLM判断。普通增长快照约600ms合并一次，ASR修订立即提交以使旧计划失效，等待接收时只保留最新快照；未完整的名称、金额和对象留在pending。停止录音不再等待本地静音帧，云端最终确认相同文字不会重放动作。
+
+累计快照替换旧转写，不能再拼接一次；相同内容的最终确认不会重放。Agent保留成功工具历史，ASR修订使尚未提交的旧操作失效，已经执行的可逆编辑由Agent按修订内容作必要更正。提前执行使用的是暂稳定转写，不能保证后续ASR永不改字。结束录音会发送最终音频包并等待尾句；断线不会强制提交尚未交付的尾句，也不会撤销已经执行的操作。每个录音会话独立，真实重复指令仍保留。状态接口的 `ready` 表示配置可用，真正鉴权在开始录音的WebSocket握手时发生。
+
+方舟 LLM 配置为 `OPENAI_BASE_URL=https://ark.cn-beijing.volces.com/api/plan/v3`、`OPENAI_MODEL=deepseek-v4.1-flash`、`OPENAI_API_KEY=<Plan专属密钥>`、`OPENAI_ENABLE_THINKING=false`，后端使用 `thinking.type=disabled` 兼容强制工具调用。回退语音只需将 `ASR_PROVIDER=moss` 后重启后端、刷新网页。
+
+接口参考：[Agent Plan语音模型](https://docs.volcengine.com/docs/ark/agent-plan-personal-voice-model?lang=zh)、[语音二进制协议](https://www.volcengine.com/docs/6561/1354869)。
+
+无停顿验收音频由 `scripts/make-voice-lifecycle.py` 一次TTS生成，没有插入静音或等待执行；现有 `.data/voice-lifecycle/lifecycle.wav` 长32.594秒。使用隔离工作台执行 `VOICE_TEST_URL=<隔离地址> PLAYWRIGHT_MODULE=<模块路径> node scripts/test-voice-lifecycle.mjs`。断言五个状态按顺序出现，前四步在讲话结束前完成，最后删除测试页，其他页内容和ID不变，且没有半句/未要求内容写入。脚本保留失败证据，不放宽断言重试。
+
+语音指令使用一轮Agent决策，每轮只发送一次模型请求，直接流式接收工具方案。状态接口的 `voiceModelReplicas` 固定为 `1`，SSE保留实际请求计数以便测量。

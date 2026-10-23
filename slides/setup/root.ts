@@ -17,6 +17,7 @@ export default defineRootSetup(() => {
   let requestedRevision = -1;
   let publishedRevision = -1;
   let blocked = false;
+  let waitingSince = 0;
   const publishedKeys = new Map<string, string>();
   const app = getCurrentInstance()?.appContext.app;
   const previousHandler = app?.config.errorHandler;
@@ -41,7 +42,7 @@ export default defineRootSetup(() => {
     if (disposed || blocked) return;
     generation++;
     // Schedule once; a stream of HMR events must not keep postponing the deadline.
-    if (!timer) timer = setTimeout(() => { timer = undefined; void publish(); }, 450);
+    if (!timer) timer = setTimeout(() => { timer = undefined; void publish(); }, 80);
   }
   async function publish() {
     const version = generation;
@@ -81,6 +82,16 @@ export default defineRootSetup(() => {
       const content = container?.querySelector<HTMLElement>('#slide-content');
       if (!container || !content) throw new Error('后台页面结构不完整');
       if (document.querySelector('vite-error-overlay')) throw new Error('幻灯片编译失败');
+      // HMR can publish metadata before Vue has mounted the new page. Retry the
+      // actual readiness condition, rather than padding every update by 450ms.
+      if (routes.some(route => {
+        const page = container.querySelector(`[data-slidev-no="${route.no}"]`);
+        return !page || page.querySelector('.slidev-slide-loading');
+      })) {
+        waitingSince ||= performance.now();
+        if (performance.now() - waitingSince > 20000) throw new Error('页面渲染就绪超时');
+        schedule(); return;
+      }
       // Resource readiness is checked once, in the replacement iframe, per changed page.
       const width = parseFloat(content.style.width) || 980;
       const height = parseFloat(content.style.height) || 552;
@@ -122,6 +133,7 @@ export default defineRootSetup(() => {
       for (const route of routes) publishedKeys.set(String(route.meta.slide?.frontmatter.imslideId), keyOf(route));
       for (const id of publishedKeys.keys()) if (!order.includes(id)) publishedKeys.delete(id);
       publishedRevision = contentRevision;
+      waitingSince = 0;
       window.parent.postMessage({ type: 'imslide:pages', pages, order, revision: contentRevision }, parentOrigin);
     } catch (error) {
       // A failed replacement never removes the last complete visible document.
@@ -132,7 +144,7 @@ export default defineRootSetup(() => {
     if (event.source !== window.parent || event.origin !== parentOrigin || event.data?.type !== 'imslide:navigate') return;
     const next = event.data.revision;
     if (!Number.isInteger(next) || next <= requestedRevision) return;
-    requestedRevision = next; blocked = false;
+    requestedRevision = next; blocked = false; waitingSince = 0;
     if (next > publishedRevision) schedule();
   };
   window.addEventListener('message', receive);

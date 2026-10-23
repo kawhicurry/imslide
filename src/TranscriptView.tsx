@@ -6,5 +6,6 @@ export function TranscriptView({ value, listening }: { value: View; listening: b
       <span className="transcript-fixed" aria-label="已固定文字">{value.fixed}</span>
       <span className="transcript-pending" aria-label="待确认文字">{value.pending}</span>
     </div>
+    {!listening && value.pending && !value.processing && <span className="sr-only">麦克风已关闭，待确认文字尚未执行</span>}
   </section>;
 }

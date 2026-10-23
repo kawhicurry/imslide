@@ -29,3 +29,29 @@
 .slide-frame:fullscreen{width:100vw!important;height:100dvh!important;max-width:none!important;max-height:none!important;aspect-ratio:auto;border-radius:0;box-shadow:none;background:#fff}
 .slide-frame::backdrop{background:#fff}
 .slide-cache iframe{background:#fff}
+
+/* Tool history stays separate from the continuous dictation document. */
+.chat-panel{min-width:0}
+.tool-panel{flex:0 1 auto;min-height:0;max-height:42%;display:flex;flex-direction:column;border-top:1px solid #e5ebe2;padding:14px 16px 0;background:#fbfcfa}
+.tool-heading{display:flex;align-items:center;gap:7px;color:#52664a;flex-shrink:0}
+.tool-heading strong{font-size:12px;font-weight:600}.tool-heading>span{margin-left:auto;font-size:10px;color:#7d8977}
+.tool-session-status{font-size:10px;color:#778571;margin:8px 0 10px;flex-shrink:0}
+.tool-list{overflow:auto;min-height:0;overscroll-behavior:contain;padding-bottom:3px}
+.tool-entry{border:1px solid #e1e8dc;border-radius:7px;background:white;margin-bottom:7px;font-size:11px}
+.tool-entry summary{display:flex;align-items:center;gap:8px;padding:10px;cursor:pointer;list-style:none}
+.tool-entry summary::-webkit-details-marker{display:none}.tool-entry summary:focus-visible{outline:2px solid #789368;outline-offset:-2px;border-radius:6px}
+.tool-description{display:flex;flex-direction:column;gap:4px;min-width:0;flex:1}.tool-description strong{font-size:11px;font-weight:550;color:#344b36}.tool-description>span{font-size:10px;color:#7a8975;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tool-entry summary>svg{flex-shrink:0}.tool-status{font-size:9px;white-space:nowrap}.tool-success{color:#537949}.tool-running{color:#687c9d}.tool-failed{color:#b45d45}.tool-skipped,.tool-unknown{color:#997d47}
+.tool-entry[open] .tool-chevron{transform:rotate(90deg)}.tool-spinner{animation:spin 1s linear infinite}
+.tool-detail{border-top:1px solid #edf0e9;padding:10px;color:#56634f}.tool-meta{display:flex;justify-content:space-between;gap:8px;overflow-wrap:anywhere;font-size:10px}.tool-meta code{min-width:0}
+.tool-detail h4{font-size:10px;font-weight:500;margin:12px 0 5px;color:#7b8875}.tool-detail pre{max-height:200px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin:0;background:#f4f6f1;padding:8px;border-radius:4px;font:10px/1.6 ui-monospace,SFMono-Regular,monospace;color:#43533d;tab-size:2}
+.tool-error-text{color:#a5513f;font-size:11px;line-height:1.7;overflow-wrap:anywhere;margin:8px 0}
+.tool-history-note{font-size:9px;color:#899581;margin:7px 0 10px;flex-shrink:0}.composer-area .activity{margin-bottom:8px}
+@media(max-width:680px){.tool-panel{max-height:340px;flex-shrink:0;padding:14px 24px 0}}
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+/* Real snapshots: fixed slide viewport, scaled as a whole; no excerpt reflow. */
+.thumbnail{padding:0;position:relative;aspect-ratio:auto;min-height:0}
+.thumbnail:empty{aspect-ratio:16/9}
+.thumbnail-documents{position:relative;display:block;width:100%;overflow:hidden;contain:layout paint;pointer-events:none}
+.thumbnail-documents iframe{position:absolute;left:0;top:0;border:0;display:block;transform-origin:top left;pointer-events:none}
+@media(max-width:680px){.thumbnail{height:auto}}
