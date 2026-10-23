@@ -58,7 +58,13 @@ try{
   await mutate('update_page',{title:'Recovered',content:'# Recovered',layout:'center'});await content('Recovered');
   await page.getByRole('alert').filter({hasText:'渲染失败'}).waitFor({state:'detached'});checks.push('slow resources retain previous image; failed image and recovery');
   await mutate('update_page',{title:'Math',content:'# Math\n\n$$E=mc^2$$',layout:'center'});await content('Math');await main.locator('.katex').first().waitFor();
-  await mutate('update_page',{title:'Diagram',content:'# Diagram\n\n```mermaid\ngraph LR\n A-->B\n```',layout:'center'});await content('Diagram');await main.locator('.mermaid svg').waitFor();
+  await mutate('update_page',{title:'Diagram',content:'# Diagram\n\n```mermaid\ngraph LR\n A[输入]-->B[输出]\n```',layout:'center'});await content('Diagram');await main.locator('.mermaid svg.pele-flowchart').waitFor();
+  await page.screenshot({path:resolve(out,'pele-flowchart.png')});
+  for (const [type,source] of [['sequence','sequenceDiagram\n Alice->>Bob: Hello'],['pie','pie\n "A": 60\n "B": 40']]) {
+    await mutate('update_page',{title:'Diagram',content:`# Diagram\n\n\`\`\`mermaid\n${source}\n\`\`\``,layout:'center'});
+    await main.locator(`.mermaid svg.pele-${type}`).waitFor();
+  }
+  checks.push('Pele SVG snapshots: Chinese flowchart, sequence and pie');
   assert.equal(await page.locator('.live-document').innerText(),'更新验收标题');checks.push('math and diagram additions preserve session');
   for(let i=0;i<5;i++)await mutate('update_page',{title:`Latest ${i}`,content:`# Latest ${i}`,layout:'center'});
   await content('Latest 4');checks.push('rapid revision convergence');

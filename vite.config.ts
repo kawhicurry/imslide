@@ -10,6 +10,8 @@ export default defineConfig(async ({ command }) => {
   const entry=resolve(dirname(source), `.${basename(source,'.md')}.active.md`);
   // The backend publishes the selected document without changing this compiler's entry.
   const options = await resolveOptions({ entry, routerMode: 'memory' }, command === 'build' ? 'build' : 'dev');
+  // App-wide setups also apply to documents stored outside the slides directory.
+  options.roots = [...new Set([resolve('.'), ...options.roots])];
   // Compile static math/diagrams up front so adding either never reloads the workspace.
   options.data.features = {...options.data.features, katex:true, mermaid:true};
   options.utils = await createDataUtils(options);
