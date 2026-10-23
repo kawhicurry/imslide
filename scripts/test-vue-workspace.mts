@@ -67,7 +67,19 @@ try{
   assert.equal((await main.locator('.snapshot-viewport').innerText()).trim(),'');
   await mutate('update_page',{title:'Inserted',content:'# Inserted',layout:'center'});await content('Inserted');
   await mutate('delete_page',{pages:2});await content('Page 2');checks.push('blank creation, populate and delete selected page');
-  await page.getByRole('button',{name:'演示',exact:true}).last().click();await page.locator('.left-workspace.presentation').waitFor();assert.ok(await page.locator('.chat-panel').isVisible());assert.equal(await page.locator('.sidebar').count(),0);await page.keyboard.press('Escape');await page.locator('.sidebar').waitFor();await page.waitForTimeout(200);checks.push('presentation retains chat; Escape restores preview');
+  assert.equal(await page.getByRole('navigation',{name:'工作区模式'}).count(),0);
+  await page.getByRole('button',{name:'演示',exact:true}).click();await page.waitForFunction(()=>!!document.fullscreenElement);await page.locator('.left-workspace.presentation').waitFor();
+  assert.ok(await main.evaluate((el:HTMLElement)=>el.getBoundingClientRect().width>=window.innerWidth-1));
+  assert.equal(await page.locator('.chat-panel').count(),1);
+  await page.evaluate(()=>document.exitFullscreen());await page.locator('.left-workspace.preview').waitFor();await page.waitForFunction(()=>!document.fullscreenElement);
+  // Tool-driven transitions cannot invent a user gesture. Exercise the denied path.
+  await page.evaluate(()=>{(window as any).originalFullscreen=Element.prototype.requestFullscreen;Element.prototype.requestFullscreen=()=>Promise.reject(new DOMException('User gesture required','NotAllowedError'));});
+  await mutate('switch_mode',{mode:'presentation'});await page.getByRole('button',{name:'点击进入全屏演示',exact:true}).waitFor();assert.equal(await page.evaluate(()=>!!document.fullscreenElement),false);
+  await page.evaluate(()=>{Element.prototype.requestFullscreen=(window as any).originalFullscreen;});
+  await page.getByRole('button',{name:'点击进入全屏演示',exact:true}).click();await page.waitForFunction(()=>!!document.fullscreenElement);
+  await page.keyboard.press('ArrowLeft');await content('Latest 4');await page.keyboard.press('ArrowRight');await content('Page 2');
+  await mutate('switch_mode',{mode:'preview'});await page.waitForFunction(()=>!document.fullscreenElement);
+  await page.waitForTimeout(200);checks.push('hidden mode navigation; native fullscreen; external exit sync; tool request denied then click succeeds; fullscreen navigation and tool exit');
   await page.evaluate(()=>{(window as any).longTasks=[];new PerformanceObserver(list=>(window as any).longTasks.push(...list.getEntries().map(e=>e.duration))).observe({type:'longtask'});});
   for(let i=0;i<40;i++){await page.locator('.page-list').evaluate((el:HTMLElement,n:number)=>el.scrollTop=n*210,i);await page.waitForTimeout(20);}
   await page.locator('.thumbnail .slide-surface[data-page-id="test-58"]').waitFor({timeout:30000});
@@ -81,7 +93,10 @@ try{
   // Multi-document flows use the real UI and compiler, with stable right-panel nodes.
   await page.getByRole('textbox',{name:'输入文字'}).fill('保留的输入草稿');
   await page.evaluate(()=>{const root=document.getElementById('root')!.shadowRoot!;(window as any).chatNode=root.querySelector('.chat-panel');(window as any).recordText=root.querySelector('.live-document')!.textContent;});
-  const mode=(name:string)=>page.getByRole('navigation',{name:'工作区模式'}).getByRole('button',{name,exact:true});
+  const mode=(name:string)=>({click:async()=>{
+    if(name==='演示') {await page.getByRole('button',{name:'演示',exact:true}).click();await page.waitForFunction(()=>!!document.fullscreenElement);}
+    else {await runtime.core.workspaceAction({tool:'switch_mode',mode:name==='文稿管理'?'management':'preview'});await page.waitForFunction(()=>!document.fullscreenElement);}
+  }});
   await mode('文稿管理').click();await page.getByRole('heading',{name:'我的文稿'}).waitFor();
   await page.getByRole('textbox',{name:'新文稿名称'}).fill('第二份文稿');await page.getByRole('button',{name:'新建文稿',exact:true}).click();
   const card=page.locator('.deck-card').filter({has:page.getByRole('heading',{name:'第二份文稿',exact:true})});await card.waitFor();
