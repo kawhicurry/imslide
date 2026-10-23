@@ -1,4 +1,5 @@
 import { computed, shallowRef, onMounted, onUnmounted, watch, type ShallowRef } from 'vue';
+import type { WorkspaceState, WorkspaceAction } from './workspace-contract';
 import type { Deck, CoreEvent } from '../imslide';
 import { OverlapVoiceInput } from './overlap-voice';
 import { StreamingVoiceInput } from './streaming-voice';
@@ -13,6 +14,8 @@ function cell<T>(): [ShallowRef<T|undefined>, (next:T|undefined|((old:T|undefine
 function cell<T>(value?:T) { const state=shallowRef(value);return [state,(next:T|undefined|((old:T|undefined)=>T|undefined))=>{state.value=typeof next==='function'?(next as (old:T|undefined)=>T|undefined)(state.value):next;}]; }
 export function useWorkspace() {
 
+    const workspace=shallowRef<WorkspaceState>({mode:'management',activeDeckId:null,workspaceRevision:-1,decks:[]});
+    const covers=shallowRef<Record<string,CachedSlide>>({});
     const [deck, setDeck] = cell<Deck>();
     const receivedDeck = shallowRef<Deck | undefined>(undefined);
     const [navigating, setNavigating] = cell(false);
@@ -45,9 +48,26 @@ export function useWorkspace() {
  const page = computed(() => deck.value?.pages[index.value]);
  function receiveDeck(next: Deck) {
  const previous = receivedDeck.value;
- if (previous && next.revision < previous.revision) return;
+ if (next.workspaceRevision!==undefined && next.workspaceRevision<workspace.value.workspaceRevision)return;
+ if(previous?.deckId!==next.deckId) {
+   if(previous?.deckId && cachedSlides.value[0])covers.value={...covers.value,[previous.deckId]:cachedSlides.value.find(s=>s.page===1) || cachedSlides.value[0]};
+   setCachedSlides([]);setRendered(undefined);setRenderError(undefined);receivedDeck.value=undefined;
+ }
+ if (previous?.deckId===next.deckId && previous && next.revision < previous.revision) return;
  receivedDeck.value=next; setDeck(next);
- setCachedSlides(current=>advanceSlideCache(current,previous,next));
+ setCachedSlides(current=>advanceSlideCache(current,previous?.deckId===next.deckId?previous:undefined,next));
+ }
+ function receiveWorkspace(state:WorkspaceState,next:Deck) {
+   if(state.workspaceRevision<workspace.value.workspaceRevision)return;
+   workspace.value=state;receiveDeck(next);
+ }
+ async function workspaceAction(action:WorkspaceAction) {
+   const state=workspace.value;
+   try {
+     const response=await fetch('/api/workspace/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,context:{deckId:state.activeDeckId,workspaceRevision:state.workspaceRevision}})});
+     const result=await response.json();if(!response.ok)throw new Error(result.error || '操作失败');
+     receiveWorkspace(result.workspace,result.deck);setError('');return result;
+   } catch(cause){setError((cause as Error).message);}
  }
     const connectEvents = () => {
         let stopped = false;
@@ -78,6 +98,7 @@ export function useWorkspace() {
             stream.onmessage = message => {
                 const event: CoreEvent = JSON.parse(message.data);
                 setToolActivity(items => reduceToolActivity(items, event));
+                if(event.type==='workspace')receiveWorkspace(event.workspace,event.deck);
                 if (event.type === 'deck' || event.type === 'done')
                     receiveDeck(event.deck);
                 if (event.type === 'started' || event.type === 'accepted') {
@@ -187,14 +208,15 @@ export function useWorkspace() {
         voice.value.start();
     }
     function view(target: number) {
-        if (!deck.value || navigating.value || target < 0 || target >= deck.value.pages.length)
+        if (workspace.value.mode==='management' || !deck.value || navigating.value || target < 0 || target >= deck.value.pages.length)
             return;
         const pageId = deck.value.pages[target].id;
+        const context={deckId:workspace.value.activeDeckId,workspaceRevision:workspace.value.workspaceRevision};
         setNavigating(true);
         setError('');
         const task = outgoing.value.then(async () => {
             try {
-                const response = await fetch('/api/view', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pageId }) });
+                const response = await fetch('/api/view', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pageId,...context }) });
                 const result = await response.json();
                 if (!response.ok)
                     throw new Error(result.error || '页面切换失败');
@@ -212,10 +234,12 @@ export function useWorkspace() {
     const handler = (event: KeyboardEvent) => {
  const target = event.composedPath()[0];
  if (target instanceof HTMLElement && target.closest('textarea,input,[contenteditable="true"]')) return;
+ if(workspace.value.mode==='management')return;
+ if(event.key==='Escape' && workspace.value.mode==='presentation'){void workspaceAction({tool:'switch_mode',mode:'preview'});return;}
  if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {event.preventDefault();view(index.value+(event.key==='ArrowRight'?1:-1));}
  };
  onMounted(()=>window.addEventListener('keydown',handler));
  onUnmounted(()=>window.removeEventListener('keydown',handler));
 
- return {deck,index,page,navigating,rendered,connected,running,renderError,cachedSlides,error,input,inputMode,messages,listening,transcript,activity,toolActivity,voice,chatEnd,canvas,submit,toggleVoice,view,setCachedSlides,setRenderError,setRendered};
+ return {workspace,covers,workspaceAction,deck,index,page,navigating,rendered,connected,running,renderError,cachedSlides,error,input,inputMode,messages,listening,transcript,activity,toolActivity,voice,chatEnd,canvas,submit,toggleVoice,view,setCachedSlides,setRenderError,setRendered};
 }

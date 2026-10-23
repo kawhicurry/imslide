@@ -1,12 +1,15 @@
 import 'dotenv/config';
-import { resolve } from 'node:path';
+import { resolve, dirname, basename } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { defineConfig, type HmrContext } from 'vite';
 import { resolveOptions, ViteSlidevPlugin, parser, createDataUtils } from '@slidev/cli';
 import compatibility from './slides/vite.config.ts';
 
 export default defineConfig(async ({ command }) => {
-  const options = await resolveOptions({ entry: resolve(process.env.SLIDES_FILE || 'slides/slides.md'), routerMode: 'memory' }, command === 'build' ? 'build' : 'dev');
+  const source=resolve(process.env.SLIDES_FILE || 'slides/slides.md');
+  const entry=resolve(dirname(source), `.${basename(source,'.md')}.active.md`);
+  // The backend publishes the selected document without changing this compiler's entry.
+  const options = await resolveOptions({ entry, routerMode: 'memory' }, command === 'build' ? 'build' : 'dev');
   // Compile static math/diagrams up front so adding either never reloads the workspace.
   options.data.features = {...options.data.features, katex:true, mermaid:true};
   options.utils = await createDataUtils(options);
@@ -15,6 +18,12 @@ export default defineConfig(async ({ command }) => {
   return {
     plugins: [{name:'imslide-prune-removed-styles',enforce:'post',handleHotUpdate(ctx: HmrContext) {
       return ctx.modules.filter(module => {
+        // Removed slide proxies can survive in Vite's graph without importers.
+        // Sending those orphan proxies through HMR forces a full app reload.
+        if (/^\/@slidev\/slides\/\d+\//.test(module.id || '') && !module.importers.size && !module.isSelfAccepting) {
+          ctx.server.moduleGraph.invalidateModule(module);
+          return false;
+        }
         const match=module.id?.match(/__slidev_(\d+)\.md\?vue&type=style&index=(\d+)/);
         if(!match)return true;
         const content=options.data.slides[Number(match[1])-1]?.content || '';

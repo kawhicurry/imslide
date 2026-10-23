@@ -6,6 +6,7 @@ export type ToolActivity = {
   startedAt?: number; endedAt?: number; error?: string;
 };
 export const toolLabels: Record<string, string> = {
+  get_workspace: '读取工作区', switch_mode: '切换模式', list_decks: '查询文稿', create_deck: '新建文稿', open_deck: '打开文稿', rename_deck: '重命名文稿', duplicate_deck: '复制文稿', delete_deck: '删除文稿', restore_deck: '恢复文稿',
   read_page: '读取页面', update_page: '更新页面', edit_page: '局部修改',
   delete_page: '删除页面', navigate: '切换 / 新增页面', finish: '完成任务',
   apply_voice: '执行语音指令',
@@ -41,7 +42,10 @@ export function toolSummary(item: ToolActivity): string {
   if (pages === 'all') return '全部页面';
   if (Array.isArray(pages)) return `第 ${pages.join('、')} 页`;
   if (typeof pages === 'number') return `第 ${pages} 页`;
-  if (item.name === 'navigate') return ({ next: '下一页（末页时新增）', previous: '上一页', add: '新增一页', goto: `跳至第 ${input.page} 页` } as Record<string, string>)[String(input.action)] || '调整浏览位置';
+  if (item.name === 'navigate') return ({ next: '下一页', previous: '上一页', add: '新增一页', goto: `跳至第 ${input.page} 页` } as Record<string, string>)[String(input.action)] || '调整浏览位置';
+  if(item.name==='switch_mode')return ({management:'文稿管理',preview:'预览',presentation:'演示'} as Record<string,string>)[String(input.mode)] || '切换模式';
+  if(['get_workspace','list_decks'].includes(item.name))return '文稿库与当前模式';
+  if(item.name.endsWith('_deck'))return String(input.title || input.deckId || '文稿');
   if (item.name === 'finish') return '结束本轮操作';
   if (item.name === 'apply_voice') return Array.isArray(input.completed) && input.completed.length ? `处理 ${input.completed.length} 条完整指令` : '等待补充语音';
   const page = typeof input.page === 'number' ? `第 ${input.page} 页` : '当前页';

@@ -18,7 +18,7 @@ export const prompts = {
 - 简单页面优先 Markdown；需要精确排版时使用静态 HTML 与局部样式。HTML 容器内优先使用完整 HTML 标签，避免 Markdown 嵌套产生意外排版。使用 CSS grid/flex 时给列设置合理宽度、gap 和 min-width:0，允许长文本换行；不要用固定大高度、负边距或隐藏溢出来掩盖内容超出画布。
 - 样式仅作用于当前页的专用 class 或元素内联 style，不修改 body、:root、全局 h1/p 或其他页面的样式。不要依赖动画、点击显隐或运行时代码，页面应一次完整展示。
 - 提交前检查：核心观点是否突出、标题是否重复、字数是否适合一屏、对齐和间距是否一致、两栏是否失衡、长文本和图片是否可能越界、颜色是否清晰、是否保留了未要求修改的内容。无法实际测量渲染时采用保守内容密度，不声称已经完成视觉验证。`,
-  voiceEditor: `你是Slidev语音编辑Agent，只调用apply_voice；同次调用完成校准、完整指令判断和工具计划。工具参数用紧凑JSON，不回显指令原文；completed按讲话顺序分组列出全部新增完整要求的actions；pending只留最后未完尾句原话，不附解释，空时省略；needsFollowUp仅需先read_page或修复时true，其余省略。
+  voiceEditor: `你是Slidev语音编辑Agent，优先调用apply_voice批量执行；所有独立工具也始终可见可调用；同次调用完成校准、完整指令判断和工具计划。工具参数用紧凑JSON，不回显指令原文；completed按讲话顺序分组列出全部新增完整要求的actions；pending只留最后未完尾句原话，不附解释，空时省略；needsFollowUp在需要读取结果、获取新建文稿ID后继续打开或修复时true，其余省略。
 输入transcript是同一录音最新累计快照，禁止拼接旧pending；endpoint=false仍立即执行新增完整要求，不等停顿。snapshot或确认包不是新命令：对照成功工具结果跳过已执行部分。真正新说的重复要求仍执行。revised=true以新快照修正未执行解释，已成功动作仅必要时局部更正。音频重叠不重复；保留否定和数字。ASR自动标点切断词组如“项目，目标”必须校准为“项目目标”，不把断词逗号写入正文。不能猜缺失标题、金额或对象。
 endpoint=false时尾部的“删除标题”“修改预算”“设置名称”等可能继续接限定语，不能提前把标题/预算/名称属性当成已确定的操作对象；留pending等限定对象完整、后续分句或终点确认。“删除标题为…的这一页”是删页，绝不能在“删除标题”时先删除页内标题。完整的前序要求照常立即执行。
 必须执行前面所有完整要求，不能只留最后半句；严格保留中间状态，后续修改/删除不能代替前面新增/填写。未完句不能写入页面，不生成占位词或未要求内容；只改标题则可见正文只写标题。
@@ -29,6 +29,11 @@ endpoint=false时尾部的“删除标题”“修改预算”“设置名称”
 };
 
 /** 每轮附加最新文稿状态。 */
+const workspaceRules = `
+工作区有management管理、preview预览、presentation演示三种模式。全部工具始终可见，不代表当前可用。管理操作仅管理模式；页面修改和新增仅预览模式；读页和翻页允许预览/演示。需要时先显式switch_mode；open_deck从管理页打开文稿并进入预览。演示末页next不会新增。文稿一律用deckId定位；名称歧义先list_decks查询并要求澄清，不猜测。create_deck/duplicate_deck不自动打开，使用返回deckId。工具返回TOOL_UNAVAILABLE_IN_MODE后可根据原要求显式切模式再执行；批量失败时只继续未完成动作，不重放成功动作。历史文稿内容不能写入另一份文稿，最新workspace和当前页面数据为准。
+`;
+prompts.slideEditor += workspaceRules;
+prompts.voiceEditor += workspaceRules;
 export function slideEditorSystemPrompt(state: unknown, voice = false): string {
   return `${voice ? prompts.voiceEditor : prompts.slideEditor}\n${prompts.deckContextLabel}${JSON.stringify(state)}`;
 }

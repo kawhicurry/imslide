@@ -31,7 +31,7 @@ async function fixture(handler: (payload: Payload, res: ServerResponse) => Promi
   });
   model.listen(0, '127.0.0.1'); await once(model, 'listening');
   const port = (model.address() as AddressInfo).port;
-  const runtime = await serve({ file: join(temp, 'slides.md'), quietMs: 25, model: createOpenAI({ apiKey: 'fixture-only', baseURL: `http://127.0.0.1:${port}/v1` }).chat('fixture'), onEvent: event => events.push(event) }, 0);
+  const runtime = await serve({ library:false, file: join(temp, 'slides.md'), quietMs: 25, model: createOpenAI({ apiKey: 'fixture-only', baseURL: `http://127.0.0.1:${port}/v1` }).chat('fixture'), onEvent: event => events.push(event) }, 0);
   if (!runtime.server.listening) await once(runtime.server, 'listening');
   const base = `http://127.0.0.1:${(runtime.server.address() as AddressInfo).port}`;
   return { ...runtime, base, events, requests, temp, async cleanup() {
@@ -133,7 +133,7 @@ test('viewer SSE receives snapshots; receiving or browsing never writes the docu
       return JSON.parse(item.replace(/^data: /, '')) as CoreEvent;
     }
     const before = await readFile(join(f.temp, 'slides.md'), 'utf8');
-    const initial = await nextEvent(); assert.equal(initial.type, 'deck');
+    const initial = await nextEvent(); assert.equal(initial.type, 'workspace');
     await fetch(f.base + '/api/deck');
     assert.equal(await readFile(join(f.temp, 'slides.md'), 'utf8'), before);
     // Only an Agent tool changes the state and sends a new snapshot.
@@ -228,7 +228,7 @@ test('view selection and Agent editing share one stable page ID, without allowin
   try {
     f.core.steer('下一页', 'second-page'); await f.core.waitForIdle();
     const before = f.core.snapshot(); const firstId = before.pages[0].id;
-    const response = await fetch(f.base + '/api/view', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pageId: firstId }) });
+    const response = await fetch(f.base + '/api/view', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pageId: firstId, deckId:'legacy', workspaceRevision:0 }) });
     assert.equal(response.status, 200); assert.equal((await response.json()).current, 0);
     f.core.steer('修改当前页', 'edit-selected'); await f.core.waitForIdle();
     const after = f.core.snapshot();

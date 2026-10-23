@@ -5,6 +5,7 @@ import { ArrowUp, ChevronLeft, ChevronRight, Layers, Maximize2, Mic, Radio, Keyb
 import setupRoot from '@slidev/client/setup/root.ts';
 import { disableBuiltinSync } from '@slidev/client';
 import { useWorkspace } from './useWorkspace';
+import DeckLibrary from './DeckLibrary.vue';
 import ToolActivity from './ToolActivity.vue';
 import SlideRenderer from './SlideRenderer.vue';
 import SlideSurface from './SlideSurface.vue';
@@ -13,11 +14,13 @@ import { thumbnailQueue } from './thumbnail-queue';
 import type { CachedSlide } from './slide-types';
 setupRoot();
 disableBuiltinSync();
-const { deck,index,page,navigating,rendered,connected,running,renderError,cachedSlides,error,input,inputMode,messages,listening,transcript,activity,toolActivity,voice,chatEnd,canvas,submit,toggleVoice,view,setCachedSlides,setRenderError,setRendered } = useWorkspace();
+const { workspace,covers,workspaceAction,deck,index,page,navigating,rendered,connected,running,renderError,cachedSlides,error,input,inputMode,messages,listening,transcript,activity,toolActivity,voice,chatEnd,canvas,submit,toggleVoice,view,setCachedSlides,setRenderError,setRendered } = useWorkspace();
 const byId = computed(() => new Map(cachedSlides.value.map(slide => [slide.pageId, slide])));
 const selected = computed(() => page.value ? byId.value.get(page.value.id) : undefined);
 function published(slide: CachedSlide) {
+  if(slide.deckId!==workspace.value.activeDeckId || slide.revision!==deck.value?.revision)return;
   if (!deck.value?.pages.some(page => page.id === slide.pageId)) return;
+  if(slide.page===1 && slide.deckId)covers.value={...covers.value,[slide.deckId]:slide};
   setCachedSlides(current => {
     const old = current.find(item => item.pageId === slide.pageId);
     if (old && old.revision > slide.revision) return current;
@@ -32,19 +35,23 @@ function send() { if (input.value.trim() && connected.value) { void submit(input
 function typing(event: KeyboardEvent) {
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); send(); }
 }
-function fullscreen() { canvas.value?.requestFullscreen().catch(() => { error.value = '浏览器未允许全屏'; }); }
+function fullscreen() { void workspaceAction({tool:'switch_mode',mode:'presentation'}); }
 function textMode() { void voice.value?.stop(); inputMode.value = 'text'; }
 </script>
 <template>
   <div class="app">
-    <SlideRenderer v-if="deck" :deck="deck" @snapshot="published" @error="setRenderError"/>
+    <SlideRenderer v-if="deck && workspace.activeDeckId" :key="workspace.activeDeckId" :deck="deck" @snapshot="published" @error="setRenderError"/>
     <header class="topbar">
       <a href="/" class="brand" aria-label="imslide 查看器"><span class="brand-icon"><Layers :size="20"/></span>imslide <span class="readonly">AGENT 创作</span></a>
-      <span class="document-name">slides.md <span>/</span> 实时演示</span>
-      <div class="header-actions"><span :class="['connection',{online:connected}]"><i/>{{ connected ? running ? 'Agent 正在更新' : '已连接' : '重新连接中' }}</span><button class="button" @click="fullscreen"><Maximize2 :size="14"/> 全屏查看</button></div>
+      <span class="document-name">{{workspace.decks.find(d=>d.id===workspace.activeDeckId)?.title || '文稿库'}}</span>
+      <div class="header-actions"><span :class="['connection',{online:connected}]"><i/>{{ connected ? running ? 'Agent 正在更新' : '已连接' : '重新连接中' }}</span><button class="button" :disabled="!workspace.activeDeckId" @click="fullscreen"><Maximize2 :size="14"/> 演示</button></div>
     </header>
     <div class="workspace">
-      <aside class="sidebar"><div class="section-label">幻灯片 <span>{{ deck?.pages.length.toString().padStart(2,'0') || '—' }}</span></div>
+      <section :class="['left-workspace',workspace.mode]" aria-label="幻灯片工作区">
+        <nav class="mode-tabs" aria-label="工作区模式"><button v-for="mode in (['management','preview','presentation'] as const)" :key="mode" :aria-pressed="workspace.mode===mode" :disabled="mode!=='management' && !workspace.activeDeckId" @click="workspaceAction({tool:'switch_mode',mode})">{{ {management:'文稿管理',preview:'预览',presentation:'演示'}[mode] }}</button><button v-if="workspace.mode==='presentation'" class="exit-presentation" @click="workspaceAction({tool:'switch_mode',mode:'preview'})">退出演示 · Esc</button></nav>
+        <DeckLibrary v-if="workspace.mode==='management'" :workspace="workspace" :covers="covers" @action="workspaceAction"/>
+        <div v-else class="preview-workspace">
+      <aside v-if="workspace.mode==='preview'" class="sidebar"><div class="section-label">幻灯片 <span>{{ deck?.pages.length.toString().padStart(2,'0') || '—' }}</span></div>
         <div class="page-list" @scroll="thumbnailQueue.pause()" @wheel="thumbnailQueue.pause()" @pointerdown="thumbnailQueue.pause()">
           <button v-for="(p,i) in deck?.pages" :key="p.id" :disabled="navigating" :class="['page-item',{selected:i===index}]" @click="view(i)" :aria-label="`查看第 ${i+1} 页：${p.title}`">
             <span class="page-index">{{ String(i+1).padStart(2,'0') }}</span><SlideThumbnail :slide="byId.get(p.id)"/><span class="page-title">{{ p.title }}</span><span v-if="i===index" class="agent-page">AGENT</span>
@@ -53,14 +60,16 @@ function textMode() { void voice.value?.stop(); inputMode.value = 'text'; }
         <div class="sidebar-footer"><Layers :size="10"/> SLIDEV ENGINE</div>
       </aside>
       <main class="main-area">
-        <div class="canvas-toolbar"><div><Radio :size="13"/> 实时预览 <span class="divider"/><span class="muted">{{ page?.title || '连接文稿中' }}</span></div></div>
+        <div v-if="workspace.mode==='preview'" class="canvas-toolbar"><div><Radio :size="13"/> 实时预览 <span class="divider"/><span class="muted">{{ page?.title || '连接文稿中' }}</span></div></div>
         <div class="canvas-region"><div ref="canvas" class="slide-frame" role="img" :aria-label="page?.title || '幻灯片'" :style="{aspectRatio:selected ? `${selected.width}/${selected.height}` : undefined}">
-          <SlideSurface :slide="selected" @ready="ready"/>
-          <div v-if="!rendered" class="placeholder">{{ renderError ? '页面未能渲染' : '正在加载文稿…' }}</div>
+          <SlideSurface :key="workspace.activeDeckId || 'empty'" :slide="selected" @ready="ready"/>
+          <div v-if="!rendered" class="placeholder">{{ renderError ? '页面未能渲染' : '' }}</div>
         </div><div class="slide-under"><span>SLIDE {{ String(index+1).padStart(2,'0') }}</span><span>Slidev Markdown</span></div></div>
         <div v-if="renderError" class="error" role="alert">渲染失败，保留当前画面：{{ renderError.message }}</div>
         <footer class="canvas-bottom"><span><kbd>←</kbd><kbd>→</kbd> 浏览页面</span><div class="pager"><button aria-label="查看上一页" :disabled="!deck || navigating || index===0" @click="view(index-1)"><ChevronLeft :size="17"/></button><span>{{ deck ? index+1 : '—' }} <i>/ {{ deck?.pages.length || '—' }}</i></span><button aria-label="查看下一页" :disabled="!deck || navigating || index >= deck.pages.length-1" @click="view(index+1)"><ChevronRight :size="17"/></button></div></footer>
       </main>
+        </div>
+      </section>
       <aside class="chat-panel">
         <div class="chat-scroll">
           <div v-if="!messages.length" class="chat-intro"><span>THINK IT. SAY IT. SLIDE IT.</span><h1>从一句话，<br/>开始你的演示。</h1></div>

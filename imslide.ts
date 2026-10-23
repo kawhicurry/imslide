@@ -1,9 +1,11 @@
 /**
- * imslide's single-file backend capability.
+ * imslide's Agent runtime and backend API.
  * Import ImSlide from this file, or run `tsx imslide.ts --serve` for a read/ingest API.
- * slides.md is the sole active document store; the web viewer never mutates it.
+ * Each document has its own Markdown source; the library publishes one renderer entry.
  */
 import 'dotenv/config';
+import { DeckLibrary } from './src/deck-library.ts';
+import { checkMode, workspaceActions, workspaceActionSchema, workspaceDescriptions, WorkspaceError, type WorkspaceAction, type WorkspaceState } from './src/workspace-contract.ts';
 import { prompts, slideEditorSystemPrompt } from './prompt.ts';
 import express from 'express';
 import { TranscriptMerger, calibrator, mergeSchema, type MergeInput } from './src/transcript-merger.ts';
@@ -30,6 +32,7 @@ export const pageSchema = z.object({
   layout: z.enum(['default', 'center', 'cover', 'two-cols', 'section', 'image-left', 'image-right']).default('default'),
 });
 const actionSchema = z.discriminatedUnion('tool', [
+  ...workspaceActions,
   z.object({ tool: z.literal('navigate'), action: z.enum(['next', 'previous', 'goto', 'add']), page: z.number().int().positive().optional() }),
   pageSchema.omit({ id: true }).extend({ tool: z.literal('update_page'), page: z.number().int().positive().optional() }),
   z.object({ tool: z.literal('edit_page'), page: z.number().int().positive().optional(), field: z.enum(['content', 'title']).default('content'), old_string: z.string().min(1).max(24000), new_string: z.string().max(24000), replace_all: z.boolean().default(false) }),
@@ -42,7 +45,7 @@ export const deckSchema = z.object({
   pages: z.array(pageSchema).min(1).max(60), current: z.number().int().min(0), revision: z.number().int().min(0),
 }).refine(d => d.current < d.pages.length && new Set(d.pages.map(p => p.id)).size === d.pages.length, '页码或页面标识无效');
 export type Page = z.infer<typeof pageSchema>;
-export type Deck = z.infer<typeof deckSchema>;
+export type Deck = z.infer<typeof deckSchema> & { deckId?: string | null; workspaceRevision?: number };
 export const blankPage = (): Page => ({ id: randomUUID(), title: '空白页面', content: '', layout: 'default' });
 export const initialDeck = (): Deck => ({ pages: [blankPage()], current: 0, revision: 0 });
 export function navigate(deck: Deck, action: 'next' | 'previous' | 'goto' | 'add', page?: number): Deck {
@@ -172,6 +175,7 @@ export class UtteranceBuffer {
 }
 
 export type CoreEvent =
+  | { type: 'workspace'; workspace: WorkspaceState; deck: Deck }
   | { type: 'deck'; deck: Deck }
   | { type: 'accepted' | 'steering-applied' | 'input-failed'; runId: string; messageId: string; error?: string }
   | { type: 'started'; runId: string }
@@ -188,7 +192,7 @@ export type CoreEvent =
 type Instruction = { id: string; text: string; voice?: MergeInput };
 type Receipt = { runId: string; messageId: string; mode: 'start' | 'steer' };
 type Run = { id: string; pending: Instruction[]; inputs: Instruction[]; controller: AbortController; completion: Promise<void>; voiceSession?: string };
-export type ImSlideOptions = { file?: string; model?: LanguageModel; quietMs?: number; onEvent?: (event: CoreEvent) => void; legacyFile?: string };
+export type ImSlideOptions = { file?: string; model?: LanguageModel; quietMs?: number; onEvent?: (event: CoreEvent) => void; legacyFile?: string; library?: boolean; libraryDirectory?: string };
 const instructionSchema = z.object({ text: z.string().trim().min(1).max(8000), id: z.string().min(1).max(120) });
 
 
@@ -204,11 +208,11 @@ export class ImSlide {
   private voiceSessions = new Map<string, { messages: ModelMessage[]; pending: string; transcript: string; audioEnd: number; lastSeq: number; receipts: Map<number, { fingerprint: string; receipt: Receipt }> }>();
   private writes: Promise<void> = Promise.resolve();
   private closed = false;
-  readonly file: string;
+  private library?: DeckLibrary;
+  get file() { return this.library?.activeFile || resolve(this.options.file ?? 'slides/slides.md'); }
   private readonly speech: UtteranceBuffer;
   private constructor(deck: Deck, private options: ImSlideOptions) {
     this.deck = deck;
-    this.file = resolve(options.file ?? 'slides/slides.md');
     if (options.onEvent) this.listeners.add(options.onEvent);
     this.speech = new UtteranceBuffer((id, text) => {
       try { this.steer(text, `speech:${id}`); }
@@ -230,12 +234,43 @@ export class ImSlide {
     }
     const core = new ImSlide(deck, options);
     // Do not rewrite an existing document on each startup.
-    if (markdown === undefined || !parseSync(markdown, file).slides[0]?.frontmatter.imslide) await core.save(deck);
+    if (markdown === undefined || (!options.library && !parseSync(markdown, file).slides[0]?.frontmatter.imslide)) await core.save(deck);
+    if (options.library) {
+      const opened = await DeckLibrary.open(file, deck, options.libraryDirectory);
+      core.library = opened.library; core.deck = opened.deck;
+    }
     return core;
   }
   get configured() { return !!this.options.model; }
   get running() { return !!this.active; }
-  snapshot(): Deck { return structuredClone(this.deck); }
+  snapshot(): Deck { return { ...structuredClone(this.deck), ...(this.library ? {deckId:this.workspace().activeDeckId,workspaceRevision:this.workspace().workspaceRevision} : {}) }; }
+  workspace(): WorkspaceState { return this.library?.snapshot() || {mode:'preview',activeDeckId:'legacy',workspaceRevision:0,decks:[]}; }
+  private permission(tool: string, input: {action?:string} = {}) { checkMode(this.workspace().mode, tool, input); }
+  assertContext(context: {deckId: string | null; workspaceRevision: number}) {
+    const state=this.workspace();
+    if(context.deckId!==state.activeDeckId || context.workspaceRevision!==state.workspaceRevision)
+      throw new WorkspaceError('STALE_WORKSPACE','工作区已改变，请基于最新状态重试');
+  }
+  async workspaceAction(raw: WorkspaceAction, context?: {deckId:string|null;workspaceRevision:number}, guard?:()=>void) {
+    const action=workspaceActionSchema.parse(raw);
+    const task=this.writes.then(async()=>{
+      if(this.closed)throw new Error('能力已关闭');
+      guard?.();if(context)this.assertContext(context);
+      this.permission(action.tool);
+      if(action.tool==='get_workspace')return {ok:true,workspace:this.workspace(),deck:this.snapshot()};
+      if(!this.library)throw new WorkspaceError('LIBRARY_DISABLED','文稿库未启用');
+      const before=this.workspace();
+      const result=await this.library.action(action);
+      const after=this.workspace();
+      // A UI/API context switch cancels old intent, never replans it against another document.
+      if(!guard && (before.mode!==after.mode || before.activeDeckId!==after.activeDeckId))this.active?.controller.abort('WORKSPACE_CHANGED');
+      if(result.deck)this.deck=result.deck;
+      const workspace=this.workspace(),deck=this.snapshot();
+      this.emit({type:'workspace',workspace,deck});
+      return {ok:true,...result,workspace,deck};
+    });
+    this.writes=task.then(()=>{},()=>{});return task;
+  }
   subscribe(listener: (event: CoreEvent) => void): () => void {
     this.listeners.add(listener); return () => this.listeners.delete(listener);
   }
@@ -247,7 +282,7 @@ export class ImSlide {
     const current = this.deck.pages[this.deck.current];
     const fingerprint = JSON.stringify(current);
     const unchanged = known?.get(current.id) === fingerprint;
-    return { currentPage: this.deck.current + 1, revision: this.deck.revision,
+    return { workspace: this.workspace(), currentPage: this.deck.current + 1, revision: this.deck.revision,
       pages: this.deck.pages.map(({ title, layout }, index) => ({ page: index + 1, title, layout })),
       ...(unchanged ? { currentContentUnchanged: true } : { currentContent: current.content }) };
   }
@@ -269,22 +304,27 @@ export class ImSlide {
       guard?.();
       const next = update(this.deck);
       if (next === this.deck) return this.snapshot();
+      const previousPages=this.deck.pages;
       const validated = deckSchema.parse(next);
       const selected = this.deck.pages[this.deck.current].id !== validated.pages[validated.current].id;
       if (JSON.stringify(validated.pages) === JSON.stringify(this.deck.pages)) {
         // Browsing is session state: never rewrite Markdown just to move the cursor.
         this.deck = { ...validated, revision: this.deck.revision };
       } else await this.save(validated);
+      if(this.library)await this.library.saved(this.deck, JSON.stringify(validated.pages)!==JSON.stringify(previousPages));
       if (selected) this.selectionVersion++;
       committed?.();
-      const snapshot = this.snapshot(); this.emit({ type: 'deck', deck: snapshot }); return snapshot;
+      const snapshot = this.snapshot();
+      if(this.library)this.emit({type:'workspace',workspace:this.workspace(),deck:snapshot});
+      else this.emit({ type: 'deck', deck: snapshot }); return snapshot;
     });
     this.writes = task.then(() => {}, () => {});
     return task;
   }
   /** Select an existing page only; viewing and editing share this single cursor. */
-  async selectPage(pageId: string): Promise<Deck> {
+  async selectPage(pageId: string, context?: {deckId:string|null;workspaceRevision:number}): Promise<Deck> {
     return this.change(current => {
+      this.permission('navigate',{action:'goto'});if(context)this.assertContext(context);
       const index = current.pages.findIndex(page => page.id === pageId);
       if (index < 0) throw new Error('该页面已被删除，请重新选择');
       if (index === current.current) return current;
@@ -361,7 +401,8 @@ export class ImSlide {
     if (previous) return previous;
     if (!this.options.model) throw new Error('尚未配置模型');
     if (this.active && (this.active.pending.length >= 16 || this.active.inputs.length >= 64)) throw new Error('待注入指令过多，请等待当前处理完成');
-    let run = this.active;
+    const preceding = this.active?.controller.signal.aborted ? this.active.completion : undefined;
+    let run = this.active?.controller.signal.aborted ? undefined : this.active;
     const mode = run ? 'steer' : 'start';
     if (!run) {
       run = { id: randomUUID(), pending: [], inputs: [], controller: new AbortController(), completion: Promise.resolve(), voiceSession: voice?.session };
@@ -373,7 +414,7 @@ export class ImSlide {
     this.receipts.set(id, receipt);
     if (this.receipts.size > 512) this.receipts.delete(this.receipts.keys().next().value!);
     this.emit({ type: 'accepted', runId: run.id, messageId: id });
-    if (mode === 'start') { const started = run; run.completion = Promise.resolve().then(() => this.execute(started)); }
+    if (mode === 'start') { const started = run; run.completion = Promise.resolve(preceding).then(() => this.execute(started)); }
     return receipt;
   }
   private async execute(run: Run): Promise<void> {
@@ -385,10 +426,11 @@ export class ImSlide {
     let waiting = false;
     let stepRevision = this.deck.revision;
     let stepSelection = this.selectionVersion;
+    let stepWorkspace = this.workspace().workspaceRevision;
     let stepTranscript = voice?.transcript || '';
     const guard = () => {
       if (voice && run.pending.some(input => input.voice?.snapshot) && !voiceTextKey(voice.transcript).startsWith(voiceTextKey(stepTranscript))) throw new Error('STEER_REPLAN');
-      if (run.controller.signal.aborted || run.pending.some(input => !input.voice) || this.deck.revision !== stepRevision || this.selectionVersion !== stepSelection) throw new Error('STEER_REPLAN');
+      if (run.controller.signal.aborted || run.pending.some(input => !input.voice) || this.deck.revision !== stepRevision || this.selectionVersion !== stepSelection || this.workspace().workspaceRevision !== stepWorkspace) throw new Error('STEER_REPLAN');
     };
     const skipped = () => {
       toolFailed = true;
@@ -431,7 +473,7 @@ export class ImSlide {
               if (!next.pages[index]) throw new Error('指定页面不存在');
               next.pages[index] = pageSchema.parse({ ...input, id: next.pages[index].id }); next.revision++;
               return next;
-            }, guard, () => { stepRevision = this.deck.revision; stepSelection = this.selectionVersion; });
+            }, guard, () => { stepRevision = this.deck.revision; stepSelection = this.selectionVersion; stepWorkspace = this.workspace().workspaceRevision; });
             stepRevision = this.deck.revision;
             if (done) finished = true;
             return { ok: true };
@@ -464,7 +506,7 @@ export class ImSlide {
                 next.pages[index] = pageSchema.parse({ ...target, [field]: pieces.join(new_string) });
                 next.revision++;
                 return next;
-              }, guard, () => { stepRevision = this.deck.revision; stepSelection = this.selectionVersion; });
+              }, guard, () => { stepRevision = this.deck.revision; stepSelection = this.selectionVersion; stepWorkspace = this.workspace().workspaceRevision; });
               if (done) finished = true;
               return { ok: true, replacements };
             } catch (error) {
@@ -479,22 +521,45 @@ export class ImSlide {
           inputSchema: z.object({ pages: z.union([z.number().int().positive(), z.array(z.number().int().positive()).min(1).max(60), z.literal('all')]), done: completion }),
           execute: async ({ pages, done }) => {
             try {
-              await this.change(current => deletePages(current, pages), guard, () => { stepRevision = this.deck.revision; stepSelection = this.selectionVersion; });
+              await this.change(current => deletePages(current, pages), guard, () => { stepRevision = this.deck.revision; stepSelection = this.selectionVersion; stepWorkspace = this.workspace().workspaceRevision; });
               stepRevision = this.deck.revision;
               if (done) finished = true;
               return { deleted: true };
             } catch (error) { if ((error as Error).message === 'STEER_REPLAN') return skipped(); toolFailed = true; throw error; }
           },
         }),
-        navigate: tool({ description: '用户要求新增一页时用add：在当前页后插入空白页并切换过去。next仅用于下一页（末页时才新增）；previous上一页，goto跳至指定页。', inputSchema: z.object({ action: z.enum(['next', 'previous', 'goto', 'add']), page: z.number().int().optional(), done: completion }), execute: async ({ action, page, done }) => {
+        navigate: tool({ description: '用户要求新增一页时用add：在当前页后插入空白页并切换过去。next用于下一页（预览末页才新增，演示末页停止）；previous上一页，goto跳至指定页。', inputSchema: z.object({ action: z.enum(['next', 'previous', 'goto', 'add']), page: z.number().int().optional(), done: completion }), execute: async ({ action, page, done }) => {
           try {
-            await this.change(current => navigate(current, action, page), guard, () => { stepRevision = this.deck.revision; stepSelection = this.selectionVersion; });
+            await this.change(current => this.workspace().mode==='presentation' && action==='next' && current.current===current.pages.length-1 ? current : navigate(current, action, page), guard, () => { stepRevision = this.deck.revision; stepSelection = this.selectionVersion; stepWorkspace = this.workspace().workspaceRevision; });
             stepRevision = this.deck.revision;
             if (done) finished = true;
             return { ok: true };
           } catch (error) { if ((error as Error).message === 'STEER_REPLAN') return skipped(); toolFailed = true; throw error; }
         } }),
     };
+    const managementTools = Object.fromEntries(workspaceActions.map(schema => {
+      const name=schema.shape.tool.value;
+      return [name,tool({description:workspaceDescriptions[name],inputSchema:(schema as z.ZodObject<any>).omit({tool:true}).extend({done:completion}),execute:async(input:any)=>{
+        const result=await this.workspaceAction({tool:name,...input},undefined,guard);
+        stepRevision=this.deck.revision;stepSelection=this.selectionVersion;stepWorkspace=this.workspace().workspaceRevision;
+        if(input.done)finished=true;
+        return result;
+      }})];
+    }));
+    // One execution gate for direct tools and actions nested inside apply_voice.
+    const allTools: Record<string, any> = {...deckTools,...managementTools};
+    for(const [name, definition] of Object.entries(allTools)) {
+      const execute=definition.execute;
+      definition.execute=async(input:any,context:any)=>{
+        try { guard(); this.permission(name,input); return await execute(input,context); }
+        catch(error) {
+          if((error as Error).message==='STEER_REPLAN')return skipped();
+          toolFailed=true;finished=false;
+          if(error instanceof WorkspaceError)return error.result();
+          throw error;
+        }
+      };
+    }
     const voiceTool = tool({
       description: '校准并依序执行全部新增完整语音指令；未完尾句留pending。需读取后续规划时needsFollowUp=true。参数用紧凑JSON，省略空或false默认字段。',
       inputSchema: voicePlanSchema,
@@ -506,7 +571,7 @@ export class ImSlide {
             const input = { ...args, done: false, ...('pages' in args && args.pages === 'current' ? { pages: this.deck.current + 1 } : {}) };
             const callId = `${context.toolCallId}:${results.length}`;
             this.emit({ type: 'tool', runId: run.id, name, callId, input, at: Date.now() });
-            const execute = deckTools[name].execute as unknown as (input: unknown) => Promise<unknown>;
+            const execute = allTools[name].execute as unknown as (input: unknown) => Promise<unknown>;
             const written = action.tool === 'update_page' ? action.content : action.tool === 'edit_page' ? action.new_string : '';
             const existing = this.deck.pages[('page' in action && action.page ? action.page - 1 : this.deck.current)]?.content || '';
             const allowed = (voice?.transcript || '') + existing;
@@ -524,7 +589,7 @@ export class ImSlide {
               ? { ok: false, error: '局部替换重复了已有主标题，未写入。new_string只替换old_string范围；整页重写用update_page。保留单个主标题并重试此步，成功前序动作不重放。' }
               : inventedPlaceholder || copiedTail
               ? { ok: false, error: '不能把未要求的占位词或待确认尾句写入页面。只写完整内容，未完原话留在pending；此前成功动作不要重复。' }
-              : await execute(input);
+              : await execute(input).catch(error=>({ok:false,error:(error as Error).message}));
             results.push({ instruction: `完整指令${completed.indexOf(instruction) + 1}`, tool: name, output });
             this.emit({ type: 'tool-result', runId: run.id, name, callId, output, at: Date.now() });
             if (output && typeof output === 'object' && (('ok' in output && output.ok === false) || ('skipped' in output && output.skipped))) {
@@ -546,7 +611,7 @@ export class ImSlide {
       // Keep the voice system prefix invariant across document revisions so the
       // provider can reuse its prefill; mutable document state stays in user data.
       prepareStep: () => ({ system: voice ? prompts.voiceEditor : slideEditorSystemPrompt(this.state(knownPages)) }),
-      tools: voice ? { apply_voice: voiceTool } : deckTools,
+      tools: { ...allTools, apply_voice: voiceTool },
     });
     const timeout = setTimeout(() => run.controller.abort(), 120000);
     this.emit({ type: 'started', runId: run.id });
@@ -568,7 +633,7 @@ export class ImSlide {
           if (!input.voice?.snapshot || input === latestSnapshot) timeline.push({ role: 'user', content: input.text });
           this.emit({ type: 'steering-applied', runId: run.id, messageId: input.id });
         }
-        stepRevision = this.deck.revision; stepSelection = this.selectionVersion;
+        stepRevision = this.deck.revision; stepSelection = this.selectionVersion; stepWorkspace = this.workspace().workspaceRevision;
         stepTranscript = voice?.transcript || '';
         finished = false; toolFailed = false; waiting = false;
         this.emit({ type: 'model-step', runId: run.id, phase: 'start', at: Date.now() });
@@ -604,7 +669,7 @@ export class ImSlide {
     } catch (error) {
       // Failed tool traces must not inflate future requests.
       if (this.active === run) this.active = undefined;
-      const message = run.controller.signal.aborted ? '处理已取消或超时，已保存的页面会保留' : error instanceof Error && error.message.includes('32 步') ? error.message : '模型处理失败，请检查密钥、模型及网络；已保存的页面会保留';
+      const message = run.controller.signal.reason==='WORKSPACE_CHANGED' ? '工作区已切换，旧任务已停止；已完成的修改已保留' : run.controller.signal.aborted ? '处理已取消或超时，已保存的页面会保留' : error instanceof Error && error.message.includes('32 步') ? error.message : '模型处理失败，请检查密钥、模型及网络；已保存的页面会保留';
       for (const input of run.inputs) this.emit({ type: 'input-failed', runId: run.id, messageId: input.id, error: message });
       this.emit({ type: 'error', runId: run.id, error: message });
     } finally {
@@ -640,7 +705,7 @@ export async function loadModelConfiguration(env: NodeJS.ProcessEnv = process.en
   };
 }
 
-/** Local adapter: read-only document endpoints plus external, finalized ASR/steer ingestion. */
+/** Local workspace API plus finalized ASR/steer ingestion. */
 export async function serve(options: ImSlideOptions = {}, port = Number(process.env.PORT || 3001)) {
   const configuration = options.model ? undefined : await loadModelConfiguration();
   let core: ImSlide;
@@ -662,7 +727,7 @@ export async function serve(options: ImSlideOptions = {}, port = Number(process.
       return fetch(input, { ...init, dispatcher: modelConnections } as RequestInit);
     },
   }).chat(configuration.model) : undefined);
-  core = await ImSlide.open({ ...options, model });
+  core = await ImSlide.open({ library: true, ...options, model });
   const app = express();
   const asr = new LocalASR();
   app.get('/api/asr/status', async (_req, res) => {
@@ -709,6 +774,13 @@ export async function serve(options: ImSlideOptions = {}, port = Number(process.
       res.json(await paragraphText(model, text, previous));
     } catch (error) { res.status(503).json({ error: (error as Error).message }); }
   });
+  app.get('/api/workspace', (_req,res)=>res.json({workspace:core.workspace(),deck:core.snapshot()}));
+  app.post('/api/workspace/action',async(req,res)=>{
+    try {
+      const {action,context}=z.object({action:workspaceActionSchema,context:z.object({deckId:z.string().nullable(),workspaceRevision:z.number().int()})}).parse(req.body);
+      res.json(await core.workspaceAction(action,context));
+    } catch(error) { res.status(409).json(error instanceof WorkspaceError ? error.result() : {ok:false,error:(error as Error).message}); }
+  });
   app.get('/api/deck', (_req, res) => res.json(core.snapshot()));
   app.get('/api/status', (_req, res) => res.json({ configured: core.configured, model: configuration?.model ?? 'custom', voiceModelReplicas: 1, running: core.running, mode: 'steer', manualEditing: false }));
   app.get('/api/preview-health', async (_req, res) => {
@@ -717,9 +789,9 @@ export async function serve(options: ImSlideOptions = {}, port = Number(process.
   });
   app.post('/api/view', async (req, res) => {
     try {
-      const { pageId } = z.object({ pageId: z.string().min(1).max(80) }).strict().parse(req.body);
-      res.json(await core.selectPage(pageId));
-    } catch (error) { res.status(409).json({ error: error instanceof Error ? error.message : '页面切换失败' }); }
+      const { pageId, ...context } = z.object({ pageId: z.string().min(1).max(80),deckId:z.string().nullable(),workspaceRevision:z.number().int() }).strict().parse(req.body);
+      res.json(await core.selectPage(pageId,context));
+    } catch (error) { res.status(409).json(error instanceof WorkspaceError ? error.result() : {error:(error as Error).message}); }
   });
   app.get('/api/events', (_req, res) => {
     res.setHeader('Content-Type', 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.flushHeaders();
@@ -728,7 +800,7 @@ export async function serve(options: ImSlideOptions = {}, port = Number(process.
       if (res.writableLength > 262144) { res.end(); return; }
       res.write(`data: ${JSON.stringify(event)}\n\n`);
     };
-    send({ type: 'deck', deck: core.snapshot() });
+    send({ type: 'workspace', workspace:core.workspace(), deck: core.snapshot() });
     const unsubscribe = core.subscribe(send);
     const heartbeat = setInterval(() => { if (!res.destroyed) res.write(': heartbeat\n\n'); }, 15000);
     res.on('close', () => { unsubscribe(); clearInterval(heartbeat); });

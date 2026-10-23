@@ -13,3 +13,7 @@ slides/.slidev/
 # Python runtime caches
 __pycache__/
 *.py[cod]
+
+# Local document library and generated renderer entry
+.imslide/
+.*.active.md

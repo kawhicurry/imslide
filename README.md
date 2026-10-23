@@ -1,12 +1,12 @@
 # imslide
 
-**Agent 文字/语音交互工作台 + 只读 Slidev 画布 + 单文件底层能力。**
+**Agent 文字/语音工作台 + 多文稿管理 + 原生 Vue / Slidev 画布。**
 
-前端保留文字指令、语音输入和工具执行状态。模型强制只调用工具，完成后调用 `finish`，不输出解释或完成总结。所有文稿创建、内容修改和翻页指令都交给 Agent 执行；没有手动新增页面、源码编辑或直接修改文稿的入口。画布、左侧页面列表与 Agent 共用一个当前页；选中已有页面后，后续指令就操作该页。
+前端保留文字指令、语音输入和工具执行状态。模型强制只调用工具，完成后调用 `finish`，不输出解释或完成总结。左侧支持文稿管理、预览、演示三种模式；文稿管理可通过界面或语音操作，页面内容通过 Agent 编辑。右侧语音、对话和草稿在模式切换时保持挂载。画布、左侧页面列表与 Agent 共用一个当前页；选中已有页面后，后续指令就操作该页。
 
 系统提示词统一在 [`prompt.ts`](./prompt.ts) 配置，包括幻灯片编辑 Agent、动态文稿上下文前缀和语音转写校准器。修改后重启服务；开发模式会自动重载。
 
-底层的文稿读写、Vercel AI SDK Agent、语音整句稳定处理、steer 注入和本地接入接口均集中在 [`imslide.ts`](./imslide.ts)。所有页及当前页位置统一保存在 **`slides/slides.md` 一个文件**，Slidev 直接监听它并热更新。
+Agent、语音处理和 API 位于 [`imslide.ts`](./imslide.ts)，文稿库位于 `src/deck-library.ts`。原有 `slides/slides.md` 登记为第一份文稿；文稿目录、每份文稿当前页和工作区模式持久化到源文件同目录的 `.imslide/library.json`，新文稿位于 `.imslide/decks/`。Slidev 只监听同目录派生入口 `.slides.active.md`，切换文稿不启动第二个编译器。没有页 ID 的旧 Markdown 会保留原件，并生成规范化副本作为第一份文稿。
 
 ## 启动工作台
 
@@ -31,7 +31,23 @@ OPENAI_ENABLE_THINKING=false
 
 服务端从 `agent.llm.api_key` 和 `agent.llm.base_url` 读取凭据与地址。显式 `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` 优先于私有配置；`OPENAI_ENABLE_THINKING=false` 为兼容服务请求加入非思考模式开关。不要将这些参数放入 `VITE_*`，也不要提交 `.env`。
 
-不配置模型也能查看已有文稿。首次运行无文稿时，只创建一张空白页。已存在的文稿会保留。旧版 `.data/deck.json` 只用于一次性恢复匹配文稿的页标识、当前位置和版本；迁移后不再读写它，重启仅依赖 `slides.md`。
+不配置模型也能查看已有文稿。首次运行无文稿时，只创建一张空白页。已存在的文稿会保留。旧版 `.data/deck.json` 只用于一次性恢复匹配文稿的页标识、当前位置和版本；迁移后不再读写旧 JSON。备份时保留原 Markdown 和整个 `.imslide/` 目录；派生入口可由后端重建。
+
+## 文稿与模式工具
+
+首次进入管理页；新建、搜索、打开、重命名、复制、删除及回收站恢复均支持界面操作。删除不永久销毁文件。预览保留分页缩略图；演示仅占满左侧，右侧一直可用，Esc 返回预览，末页翻页不创建新页。
+
+所有文本和语音请求始终提供完整工具定义：`get_workspace`、`switch_mode`、`list_decks`、`create_deck`、`open_deck`、`rename_deck`、`duplicate_deck`、`delete_deck`、`restore_deck`，以及现有页面工具、`finish` 和 `apply_voice`。权限由执行时的后端模式控制：
+
+- 管理文稿仅管理模式；`open_deck` 打开并进入预览。
+- 页面修改及新增仅预览模式；读页及翻页允许预览、演示。
+- 查询工作区、切模式和结束始终可用；语音批量计划逐步执行同样的权限检查。
+- 不匹配返回 `TOOL_UNAVAILABLE_IN_MODE`、`currentMode` 和 `allowedModes`，不产生副作用。Agent 必须显式切模式。
+- UI/API 切换模式或活动文稿会终止旧 Agent 任务，防止旧要求重新应用到另一份文稿；录音连接保留。
+
+`GET /api/workspace` 返回 `{workspace, deck}`；`POST /api/workspace/action` 接受 `{action: {tool, ...参数}, context: {deckId, workspaceRevision}}`。`POST /api/view` 接受 `{pageId, deckId, workspaceRevision}`。过期版本返回 409 / `STALE_WORKSPACE`；SSE 的 `workspace` 事件同时携带工作区和当前文稿快照。文稿名称可重复，操作一律用列表返回的稳定 ID。
+
+当前动态编译和文稿切换通过 `npm run dev` 的单个 Vite / Slidev 服务运行。`npm run build` 检查类型并导出构建时活动文稿的静态资源，不是动态多文稿服务的替代品。
 
 ## 作为单文件模块调用
 
@@ -122,9 +138,9 @@ npm run serve
 | `GET /api/events` | SSE 事件流，连接时先发送当前文稿快照 |
 | `GET /api/status` | 是否配置模型、是否运行、steer 模式 |
 | `GET /api/preview-health` | Slidev 渲染服务状态 |
-| `POST /api/view` | 以 `{pageId}` 选择已有页，同步画布与 Agent 当前页 |
+| `POST /api/view` | 以 `{pageId, deckId, workspaceRevision}` 选择已有页，同步画布与 Agent 当前页 |
 
-前端文字对话使用 `POST /api/chat`（`{message, id?, mode: "steer"}`），已定稿语音与外部调用使用 `POST /api/input`。两者均返回接收确认，Agent 回复和页面更新通过 `/api/events` 流式返回。不提供手动新增/直接编辑文稿接口，只有 Agent 工具可以写入文稿：
+前端文字对话使用 `POST /api/chat`（`{message, id?, mode: "steer"}`），已定稿语音与外部调用使用 `POST /api/input`。两者均返回接收确认，Agent 回复和页面更新通过 `/api/events` 流式返回。文稿管理有独立接口，页面正文仍由 Agent 工具写入：
 
 ```sh
 curl -X POST http://127.0.0.1:3001/api/input \
@@ -147,7 +163,7 @@ curl -X POST http://127.0.0.1:3001/api/input \
                     imslide.ts
                    steer Agent ← 外部文字指令
                          ↓
-                  slides/slides.md
+                  文稿库 / 独立 Markdown
                          ↓
                  Slidev 监听与热更新
                          ↓
@@ -156,7 +172,7 @@ curl -X POST http://127.0.0.1:3001/api/input \
 
 页正文使用标准 Slidev Markdown；`---` 分隔页面，frontmatter 中的 `imslide`、`imslideId`、`imslideTitle`、`imslideContentKey` 保存文稿信息及页面内容指纹。不再使用第二份 JSON 文稿。原子替换源文件防止读取到半写入状态。
 
-当前页统一保存在 `deck.current`，前端没有第二套浏览游标。左侧或底部选择已有页面，通过 `POST /api/view` 提交稳定的 `pageId`；该接口只允许选择已有页，不能新增、删除或修改正文。随后发出的对话会等待选页确认，确保 Agent 操作的就是所选页面。运行中的旧工具若遇到页版本变化，会跳过并在新上下文中重新规划。
+当前页统一保存在 `deck.current`，前端没有第二套浏览游标。左侧或底部选择已有页面，通过 `POST /api/view` 提交稳定的 `pageId`、`deckId` 和 `workspaceRevision`；该接口只允许选择已有页，不能新增、删除或修改正文。随后发出的对话会等待选页确认，确保 Agent 操作的就是所选页面。运行中的旧工具若遇到页版本变化，会跳过并在新上下文中重新规划。
 
 `slides/setup/root.ts` 是 Slidev 渲染适配器。画布按页面 ID 和文稿版本导航，Slidev 回报实际渲染的 ID、页码、总页数和版本；四项匹配后才显示预览。新增或删除页面后先等待热更新，防止新页路由尚未就绪时落回旧页。适配器只在嵌入预览中启用，校验父窗口来源。
 
@@ -182,7 +198,7 @@ npm test
 
 ### 预览缓存与无缝切页
 
-工作台已迁移到 Vue 3，使用固定版本 Slidev 52.20.1 的 Vite 插件、根上下文和页面组件，在同一应用中编译并渲染 Markdown。不存在 React 外壳、后台 iframe 或页面 iframe。原生 Vue 渲染器每次只挂载一个源页面，优先当前页，完成字体、图片和布局检查后发布不可变 DOM 快照。主画布与缩略图使用同一快照和共享的不可变 CSSStyleSheet；Shadow DOM 隔离页面样式与工作台样式。更新或失败时保留旧画面，缩略图不显示更新状态。可见范围外的缩略图卸载，空闲时串行更新。文稿仍以 slides/slides.md 为准。快照继续用于只读预览，动画、视频播放和任意脚本组件不属于本工作台的支持范围。
+工作台已迁移到 Vue 3，使用固定版本 Slidev 52.20.1 的 Vite 插件、根上下文和页面组件，在同一应用中编译并渲染 Markdown。不存在 React 外壳、后台 iframe 或页面 iframe。原生 Vue 渲染器每次只挂载一个源页面，优先当前页，完成字体、图片和布局检查后发布不可变 DOM 快照。主画布与缩略图使用同一快照和共享的不可变 CSSStyleSheet；Shadow DOM 隔离页面样式与工作台样式。更新或失败时保留旧画面，缩略图不显示更新状态。可见范围外的缩略图卸载，空闲时串行更新。各文稿独立 Markdown 为准，活动文稿通过固定派生入口渲染。快照继续用于只读预览，动画、视频播放和任意脚本组件不属于本工作台的支持范围。
 
 ### 页面工具
 
@@ -266,3 +282,5 @@ MOSS 模式也需要先安装 `scripts/asr-requirements.txt`，但不需要下�
 `npm run build` 执行 Vue 类型检查及生产构建，`npm test` 包含 Vue 服务端组件渲染检查。`PLAYWRIGHT_MODULE=<Playwright模块路径> npx tsx scripts/test-vue-workspace.mts` 使用独立测试文稿、真实后端和编译器、确定性模型夹具验证文本提交、工具记录、导航、热更新、慢资源、失败恢复、增删页、全屏和60页滚动；临时测试前端使用5273，不改用户的文稿或服务端口。`scripts/test-thumbnails.mjs` 验证原生缩略图挂载边界。
 
 Slidev 的内部 Vue 接口集中在 `src/slidev-api.d.ts` 与 `src/slidev-wrapper.d.ts` 的类型边界，锁定52.20.1；升级时必须重新验证编译、主题样式与HMR。5173入口采用内存路由，页面选择仍由 `/api/view` 和文稿中的稳定页面ID控制。生产构建固定包含构建时的页面；持续编辑需要运行开发编译服务。
+
+多文稿验证：`npm test` 包含权限矩阵、持久化、模式切换、过期任务和语音批量工具测试。`tsx scripts/test-vue-workspace.mts` 使用真实后端、Slidev 和 Chromium，在独立目录运行多文稿浏览器回归；可通过 `PLAYWRIGHT_MODULE` 指定 Playwright 路径。加 `TEST_LIVE_ASR=1` 使用已配置的真实 SeedASR 静音流验证跨模式不断连。`tsx scripts/test-library-voice-live.mts` 使用已配置的真实模型验证累计语音转写到多文稿工具的完整流程，产生正常模型用量，所有文稿隔离在 `.data/`。

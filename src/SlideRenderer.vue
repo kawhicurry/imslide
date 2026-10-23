@@ -34,18 +34,22 @@ async function publish(){
   const valid=()=>!disposed && version===generation;
   let failedPage:string|undefined;
   try{
-    if(revision<deck.revision)return;
+    if(revision!==deck.revision || (configs as any).imslide?.deckId!==deck.deckId)return;
     const {imslide:_state,...visualConfig}=configs as typeof configs & {imslide?:unknown};
     const configKey=JSON.stringify(visualConfig);
     const ordered=[...nav.slides.value].sort((a,b)=>Number(b.meta.slide.frontmatter.imslideId===deck.pages[deck.current]?.id)-Number(a.meta.slide.frontmatter.imslideId===deck.pages[deck.current]?.id));
     for(const source of ordered){
       const id=String(source.meta.slide.frontmatter.imslideId),pageIndex=deck.pages.findIndex(page=>page.id===id);
       if(pageIndex<0)continue;
+      const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify(deck.pages[pageIndex])));
+      const expected=Array.from(new Uint8Array(digest),byte=>byte.toString(16).padStart(2,'0')).join('');
+      if(!valid())return;
+      if(source.meta.slide.frontmatter.imslideContentKey!==expected)continue;
       const key=JSON.stringify([source.no,source.meta.slide.frontmatter.imslideContentKey,configKey]);
       if(published.get(id)===key)continue;
       failedPage=id;
       const blank=blankSlide(deck.pages[pageIndex],pageIndex,deck.pages.length,deck.revision);
-      if(blank){emit('snapshot',blank);published.set(id,key);continue;}
+      if(blank){emit('snapshot',{...blank,deckId:deck.deckId});published.set(id,key);continue;}
       const module=await bounded(source.load());
       if(!valid())return;
       if(!module || typeof module!=='object' || !('default' in module))throw new Error(`第 ${source.no} 页模块加载失败`);
@@ -76,7 +80,7 @@ async function publish(){
       originals.forEach((node,i)=>{if(node.shadowRoot)copies[i].innerHTML=node.shadowRoot.innerHTML;});
       clone.querySelectorAll('script,iframe,object,embed').forEach(node=>node.remove());
       const sheets=await slideSheets();
-      emit('snapshot',{snapshot:crypto.randomUUID(),pageId:id,page:pageIndex+1,total:deck.pages.length,revision:deck.revision,html:clone.outerHTML,width:slideWidth.value,height:slideHeight.value,sheets});
+      emit('snapshot',{deckId:deck.deckId,snapshot:crypto.randomUUID(),pageId:id,page:pageIndex+1,total:deck.pages.length,revision:deck.revision,html:clone.outerHTML,width:slideWidth.value,height:slideHeight.value,sheets});
       published.set(id,key);
       // Yield to input between pages; the current page is always first.
       await new Promise<void>(resolve=>setTimeout(resolve,30));
@@ -86,8 +90,11 @@ async function publish(){
   }catch(error){if(valid())emit('error',renderFailure(error,{stage:'renderer',revision:deck.revision,pageId:failedPage}));}
   finally{busy=false;route.value=undefined;if(!disposed && version!==generation)schedule();}
 }
-watch(()=>JSON.stringify([props.deck.revision,props.deck.current,nav.slides.value.map(route=>[route.no,route.meta.slide.frontmatter.imslideContentKey]),configs]),schedule);
-watch(()=>props.deck.current,()=>{void nav.go(props.deck.current+1,999999);},{immediate:true});
+watch(()=>JSON.stringify([props.deck.deckId,props.deck.revision,props.deck.current,nav.slides.value.map(route=>[route.no,route.meta.slide.frontmatter.imslideContentKey]),configs]),schedule);
+watch(()=>[props.deck.current,props.deck.deckId,nav.slides.value.map(s=>s.meta.slide.frontmatter.imslideId)],()=>{
+  const selected=nav.slides.value.find(s=>s.no===props.deck.current+1 && s.meta.slide.frontmatter.imslideId===props.deck.pages[props.deck.current]?.id);
+  if(selected)void nav.go(selected.no,999999);
+},{immediate:true});
 onMounted(()=>{
   shadow=host.value!.attachShadow({mode:'open'});
   const mount=document.createElement('div');shadow.append(mount);target.value=mount;

@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { createServer as httpServer } from 'node:http';
 import { once } from 'node:events';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { AddressInfo } from 'node:net';
@@ -15,6 +15,7 @@ const out=resolve('.data/vue-integration');await mkdir(out,{recursive:true});
 const original=await readFile('slides/slides.md','utf8');
 const file=resolve(out,'slides.md');
 const deck:Deck={revision:0,current:0,pages:Array.from({length:60},(_,i)=>({id:`test-${i}`,title:`Page ${i+1}`,layout:i%2?'two-cols':'center',content:i%2?`# Page ${i+1}\n\nLeft\n\n::right::\n\nRight`:`# Page ${i+1}\n\nNative Vue slide\n\n<style>h1{color:#173f76}:global(.brand){color:red!important}</style>`}))};
+await rm(resolve(out,'.imslide'),{recursive:true,force:true});
 await writeFile(file,renderDeck(deck));
 let nextTool:{name:string;args:Record<string,unknown>}|undefined;
 const model=httpServer(async(req,res)=>{for await(const _ of req){} const action=nextTool || {name:'finish',args:{}};nextTool=undefined;
@@ -35,7 +36,7 @@ async function mutate(name:string,args:Record<string,unknown>){nextTool={name,ar
 async function content(text:string){await main.filter({hasText:text}).waitFor({timeout:30000});}
 try{
   await page.route('**/api/text/paragraphs',async(route:any)=>{const body=route.request().postDataJSON();await route.fulfill({json:{text:body.text,breakBefore:true}});});
-  await page.goto('http://127.0.0.1:5273');await content('Page 1');
+  await page.goto('http://127.0.0.1:5273');await page.getByRole('button',{name:'打开文稿：slides',exact:true}).click();await content('Page 1');
   assert.equal(await page.locator('iframe').count(),0);
   assert.notEqual(await page.locator('.brand').evaluate((el:HTMLElement)=>getComputedStyle(el).color),'rgb(255, 0, 0)');
   await page.waitForFunction(()=>{const app=document.getElementById('root')!.shadowRoot!;return app.querySelector('.selected .slide-surface')?.getAttribute('data-snapshot')===app.querySelector('.slide-frame .slide-surface')?.getAttribute('data-snapshot');});
@@ -66,7 +67,7 @@ try{
   assert.equal((await main.locator('.snapshot-viewport').innerText()).trim(),'');
   await mutate('update_page',{title:'Inserted',content:'# Inserted',layout:'center'});await content('Inserted');
   await mutate('delete_page',{pages:2});await content('Page 2');checks.push('blank creation, populate and delete selected page');
-  await page.getByRole('button',{name:'全屏查看'}).click();await page.waitForFunction(()=>!!document.fullscreenElement);await page.evaluate(()=>document.exitFullscreen());await page.waitForFunction(()=>!document.fullscreenElement);await page.waitForTimeout(200);checks.push('fullscreen');
+  await page.getByRole('button',{name:'演示',exact:true}).last().click();await page.locator('.left-workspace.presentation').waitFor();assert.ok(await page.locator('.chat-panel').isVisible());assert.equal(await page.locator('.sidebar').count(),0);await page.keyboard.press('Escape');await page.locator('.sidebar').waitFor();await page.waitForTimeout(200);checks.push('presentation retains chat; Escape restores preview');
   await page.evaluate(()=>{(window as any).longTasks=[];new PerformanceObserver(list=>(window as any).longTasks.push(...list.getEntries().map(e=>e.duration))).observe({type:'longtask'});});
   for(let i=0;i<40;i++){await page.locator('.page-list').evaluate((el:HTMLElement,n:number)=>el.scrollTop=n*210,i);await page.waitForTimeout(20);}
   await page.locator('.thumbnail .slide-surface[data-page-id="test-58"]').waitFor({timeout:30000});
@@ -77,7 +78,49 @@ try{
   assert.ok(await page.locator('.thumbnail .slide-surface').count() <= 5);
   assert.ok(await main.isVisible());assert.equal(await page.locator('iframe').count(),0);checks.push('bounded thumbnails, desktop scrolling, mobile layout');
   await page.screenshot({path:resolve(out,'mobile.png')});await page.getByRole('button',{name:'切换到语音输入'}).scrollIntoViewIfNeeded();assert.ok(await page.getByRole('button',{name:'切换到语音输入'}).isVisible());await page.setViewportSize({width:1440,height:1000});await page.screenshot({path:resolve(out,'desktop.png')});
+  // Multi-document flows use the real UI and compiler, with stable right-panel nodes.
+  await page.getByRole('textbox',{name:'输入文字'}).fill('保留的输入草稿');
+  await page.evaluate(()=>{const root=document.getElementById('root')!.shadowRoot!;(window as any).chatNode=root.querySelector('.chat-panel');(window as any).recordText=root.querySelector('.live-document')!.textContent;});
+  const mode=(name:string)=>page.getByRole('navigation',{name:'工作区模式'}).getByRole('button',{name,exact:true});
+  await mode('文稿管理').click();await page.getByRole('heading',{name:'我的文稿'}).waitFor();
+  await page.getByRole('textbox',{name:'新文稿名称'}).fill('第二份文稿');await page.getByRole('button',{name:'新建文稿',exact:true}).click();
+  const card=page.locator('.deck-card').filter({has:page.getByRole('heading',{name:'第二份文稿',exact:true})});await card.waitFor();
+  await card.getByRole('button',{name:'重命名',exact:true}).click();await page.getByRole('textbox',{name:'重命名文稿'}).fill('切换验收');await page.getByRole('button',{name:'保存',exact:true}).click();
+  await page.getByRole('button',{name:'打开文稿：切换验收',exact:true}).click();
+  await page.waitForFunction(()=>document.getElementById('root')!.shadowRoot!.querySelector('.left-workspace.preview'));
+  assert.equal((await main.innerText()).trim(),'');
+  await mutate('update_page',{title:'Document B',content:'# Document B',layout:'center'});await content('Document B');
+  const b=runtime.core.workspace().activeDeckId!,a=runtime.core.workspace().decks.find(d=>d.title==='slides')!.id;
+  await mode('文稿管理').click();
+  const bCard=page.locator('.deck-card').filter({has:page.getByRole('heading',{name:'切换验收',exact:true})});
+  await bCard.getByRole('button',{name:'复制',exact:true}).click();await page.getByRole('heading',{name:'切换验收 副本',exact:true}).waitFor();
+  await bCard.getByRole('button',{name:'删除',exact:true}).click();await page.getByRole('button',{name:'回收站',exact:true}).click();
+  await page.getByRole('button',{name:'恢复文稿',exact:true}).click();await page.getByRole('button',{name:'返回文稿',exact:true}).click();
+  await page.getByRole('searchbox',{name:'搜索文稿'}).fill('不存在的名称');await page.getByText('没有匹配的文稿').waitFor();await page.getByRole('searchbox',{name:'搜索文稿'}).fill('');
+  await page.locator('.deck-card .slide-surface').first().waitFor();
+  await page.screenshot({path:resolve(out,'library.png')});
+  await page.getByRole('button',{name:'打开文稿：切换验收',exact:true}).click();await content('Document B');
+  let releaseCross!:()=>void;const crossGate=new Promise<void>(r=>releaseCross=r);
+  await page.route('**/__cross.svg',async(route:any)=>{await crossGate;await route.fulfill({contentType:'image/svg+xml',body:'<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"/>'});});
+  await mutate('update_page',{title:'Slow B',content:'# Slow B\n\n<img src="http://127.0.0.1:5273/__cross.svg"/>',layout:'center'});await page.waitForTimeout(300);
+  await runtime.core.workspaceAction({tool:'switch_mode',mode:'management'});await runtime.core.workspaceAction({tool:'open_deck',deckId:a});releaseCross();await content('Page 2');
+  assert.ok(!(await main.innerText()).includes('Slow B'));
+  for(let i=0;i<4;i++){await runtime.core.workspaceAction({tool:'switch_mode',mode:'management'});await runtime.core.workspaceAction({tool:'open_deck',deckId:i%2?b:a});}
+  await content('Slow B');
+  assert.equal(await page.getByRole('textbox',{name:'输入文字'}).inputValue(),'保留的输入草稿');
+  assert.ok(await page.evaluate(()=>{const root=document.getElementById('root')!.shadowRoot!;return root.querySelector('.chat-panel')===(window as any).chatNode && root.querySelector('.live-document')!.textContent===(window as any).recordText;}));
+  await mode('演示').click();await page.locator('.left-workspace.presentation').waitFor();await page.screenshot({path:resolve(out,'presentation.png')});await page.keyboard.press('Escape');
+  checks.push('library CRUD/search/recycle; independent document snapshots; rapid switching; stale slow render rejected; chat DOM and draft preserved');
+  if(process.env.TEST_LIVE_ASR==='1') {
+    let sockets=0;page.on('websocket',(socket:any)=>{if(socket.url().includes('/api/asr/stream'))sockets++;});
+    await page.getByRole('button',{name:'切换到语音输入'}).click();
+    await page.evaluate(()=>{const audio=new AudioContext({sampleRate:16000});const silence=audio.createMediaStreamDestination();(window as any).testAudio=audio;navigator.mediaDevices.getUserMedia=async()=>{await audio.resume();return silence.stream;};});
+    await page.getByRole('button',{name:'开始语音输入',exact:true}).click();await page.getByRole('button',{name:'停止语音输入',exact:true}).waitFor({timeout:20000});
+    for(const [name,css] of [['文稿管理','management'],['预览','preview'],['演示','presentation'],['文稿管理','management']]){await mode(name).click();await page.locator(`.left-workspace.${css}`).waitFor();await page.getByRole('button',{name:'停止语音输入',exact:true}).waitFor();}
+    assert.equal(sockets,1);await page.getByRole('button',{name:'停止语音输入',exact:true}).click();await page.getByRole('button',{name:'开始语音输入',exact:true}).waitFor({timeout:20000});
+    checks.push('real SeedASR silent stream stays connected through all three modes (one websocket)');
+  }
   assert.deepEqual(errors,[]);assert.equal(await readFile('slides/slides.md','utf8'),original);
-  const result={passed:true,checks,thumbnailSurfaces:surfaces,longTasks,errors};await writeFile(resolve(out,'result.json'),JSON.stringify(result,null,2));console.log(result);
+  const result={passed:true,checks,thumbnailSurfaces:surfaces,longTasks,allInteractionLongTasks:await page.evaluate(()=>(window as any).longTasks),errors};await writeFile(resolve(out,'result.json'),JSON.stringify(result,null,2));console.log(result);
 }catch(error){await page.screenshot({path:resolve(out,'failure.png')});console.error('Browser errors',errors);throw error;}
 finally{await browser.close();await vite.close();await runtime.core.close();runtime.server.closeAllConnections();runtime.server.close();model.closeAllConnections();model.close();}
