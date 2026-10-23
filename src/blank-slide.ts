@@ -1,4 +1,4 @@
-import type { CachedSlide } from './SlideCache';
+import type { CachedSlide } from './slide-types';
 import type { Deck } from '../imslide';
 
 /** Empty default pages have no generated markup to compile. Render their actual
@@ -15,7 +15,7 @@ export function isCanonicalBlank(slide: CachedSlide): boolean {
 }
 
 /** Advance only caches proven to represent the preceding canonical content. A
- * stale iframe must never acquire a new revision merely because its ID matches. */
+ * stale snapshot must never acquire a new revision merely because its ID matches. */
 export function advanceSlideCache(cached: CachedSlide[], previous: Deck | undefined, next: Deck): CachedSlide[] {
   if (previous && next.revision < previous.revision) return cached;
   const available = new Map(cached.map(slide => [slide.pageId, slide]));

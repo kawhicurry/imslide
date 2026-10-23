@@ -14,7 +14,7 @@ test('only an actually empty default page can bypass compilation, with canonical
   assert.equal(blankSlide({ ...page, layout: 'cover' }, 2, 4, 9), undefined);
 });
 
-test('unchanged canonical pages reuse their iframe while stale or changed content cannot gain a newer revision', () => {
+test('unchanged canonical pages reuse their snapshot while stale or changed content cannot gain a newer revision', () => {
   const page = { id: 'existing', title: 'A', content: '# A', layout: 'default' as const };
   const before = { pages: [page], current: 0, revision: 4 };
   const cached = { ...blankSlide({ ...page, content: '' }, 0, 1, 4)!, html: '<div># A</div>', snapshot: 'rendered-A' };

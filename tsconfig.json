@@ -8,7 +8,6 @@
     ],
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "jsx": "react-jsx",
     "strict": true,
     "skipLibCheck": true,
     "esModuleInterop": true,
@@ -17,12 +16,30 @@
     "types": [
       "node",
       "vite/client"
-    ]
+    ],
+    "paths": {
+      "@slidev/client": [
+        "./src/slidev-api.d.ts"
+      ],
+      "@slidev/client/setup/*": [
+        "./src/slidev-api.d.ts"
+      ],
+      "@slidev/client/internals/SlideWrapper.vue": [
+        "./src/slidev-wrapper.d.ts"
+      ],
+      "@slidev/client/env.ts": [
+        "./src/slidev-api.d.ts"
+      ],
+      "@slidev/client/composables/useClicks.ts": [
+        "./src/slidev-api.d.ts"
+      ]
+    }
   },
   "include": [
-    "src",
+    "src/**/*.ts",
+    "src/**/*.vue",
     "imslide.ts",
-    "tests",
+    "tests/**/*.ts",
     "vite.config.ts"
   ]
 }

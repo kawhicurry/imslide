@@ -12,7 +12,7 @@ export async function openVoiceTest(audio, directory) {
   await page.route('**/__latency.wav', route => route.fulfill({ path: audio, contentType: 'audio/wav' }));
   await page.goto(process.env.VOICE_TEST_URL || 'http://127.0.0.1:5173/');
   await page.waitForSelector('.voice-orb');
-  await page.waitForSelector('.slide-cache iframe[aria-hidden="false"]', { timeout: 30000 });
+  await page.waitForSelector('.slide-frame .slide-surface[data-snapshot]', { timeout: 30000 });
   const before = await page.evaluate(async () => (await fetch('/api/deck')).json());
   const configuration = await page.evaluate(async () => ({ agent: await (await fetch('/api/status')).json(), asr: await (await fetch('/api/asr/status')).json() }));
   await page.evaluate(async () => {
@@ -52,7 +52,7 @@ export async function openVoiceTest(audio, directory) {
       if (value.type === 'deck' || window.latency.runIds.includes(value.runId)) mark('sse', { value });
     };
     const checkVisible = () => {
-      const frame = document.querySelector('.slide-cache iframe[aria-hidden="false"]');
+      const frame = document.getElementById('root').shadowRoot.querySelector('.slide-frame .slide-surface[data-snapshot]');
       const key = `${frame?.dataset.pageId}:${frame?.dataset.revision}`;
       if (frame && key !== window.latency.visibleKey) {
         window.latency.visibleKey = key;
@@ -60,7 +60,7 @@ export async function openVoiceTest(audio, directory) {
       }
     };
     const observer = new MutationObserver(checkVisible);
-    observer.observe(document.body, { subtree: true, attributes: true, childList: true }); checkVisible();
+    observer.observe(document.getElementById('root').shadowRoot, { subtree: true, attributes: true, childList: true }); checkVisible();
     const context = new AudioContext({ sampleRate: 16000 });
     const buffer = await context.decodeAudioData(await (await original('/__latency.wav')).arrayBuffer());
     const samples = buffer.getChannelData(0), hop = Math.round(buffer.sampleRate * 0.02);

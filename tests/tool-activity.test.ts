@@ -1,9 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createElement } from 'react';
-import { renderToStaticMarkup } from 'react-dom/server';
+import { renderVue } from './vue-render';
 import { reduceToolActivity, type ToolActivity as Activity } from '../src/tool-activity.ts';
-import { ToolActivity } from '../src/ToolActivity.tsx';
 import type { CoreEvent } from '../imslide.ts';
 
 const call = (runId = 'run', callId = 'one'): CoreEvent => ({ type: 'tool', runId, callId, name: 'edit_page', input: { old_string: '<script>alert(1)</script>', new_string: '新标题' }, at: 100 });
@@ -41,10 +39,10 @@ test('result received after reconnect can stand alone and history is bounded', (
   for (let i = 0; i < 110; i++) items = reduceToolActivity(items, call('run', String(i)));
   assert.equal(items.length, 100);
 });
-test('detail view escapes tool content and labels failed and pending calls accurately', () => {
+test('detail view escapes tool content and labels failed and pending calls accurately', async () => {
   let items = reduceToolActivity([], call());
   items = reduceToolActivity(items, result({ ok: false, error: '未匹配' }));
-  const html = renderToStaticMarkup(createElement(ToolActivity, { items, running: false, connected: true }));
+  const html = await renderVue('/src/ToolActivity.vue', { items, running: false, connected: true });
   assert.match(html, /局部修改/); assert.match(html, /失败/); assert.match(html, /调用参数/); assert.match(html, /执行结果/);
   assert.ok(!html.includes('<script>')); assert.match(html, /&lt;script&gt;/);
 });

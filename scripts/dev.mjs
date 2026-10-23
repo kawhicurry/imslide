@@ -27,7 +27,8 @@ async function ready(url) {
 }
 try {
   await ready(`http://127.0.0.1:${process.env.PORT || 3001}/api/deck`);
-  if (!stopping) start('dev:slides');
-  await ready('http://127.0.0.1:3030/');
   if (!stopping) start('dev:web');
+  await ready(`http://127.0.0.1:${process.env.WEB_PORT || 5173}/`);
+  if (!stopping) start('dev:slides');
+  await ready(`http://127.0.0.1:${process.env.SLIDEV_PORT || 3030}/`);
 } catch (error) { console.error(error.message); stop(1); }

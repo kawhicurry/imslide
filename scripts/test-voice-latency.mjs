@@ -17,14 +17,14 @@ try {
   const target = after.pages[after.current];
   if (before.pages.some(page => page.id === target.id)) throw new Error('Expected a newly created current page');
   await page.waitForFunction(({ id, revision }) => {
-    const frame = document.querySelector('.slide-cache iframe[aria-hidden="false"]');
+    const frame = document.getElementById('root').shadowRoot.querySelector('.slide-frame .slide-surface[data-snapshot]');
     return frame?.dataset.pageId === id && Number(frame.dataset.revision) === revision;
   }, { id: target.id, revision: after.revision }, { timeout: 30000 });
   const rendering = await page.evaluate(() => {
-    const frame = document.querySelector('.slide-cache iframe[aria-hidden="false"]');
-    return { frames: document.querySelectorAll('.slide-cache iframe').length,
-      emptyFrames: document.querySelectorAll('.slide-cache iframe[data-snapshot="canonical-empty-document"]').length,
-      actualText: frame?.contentDocument?.querySelector('#slide-content')?.textContent?.trim() };
+    const frame = document.getElementById('root').shadowRoot.querySelector('.slide-frame .slide-surface[data-snapshot]');
+    return { frames: document.getElementById('root').shadowRoot.querySelectorAll('.slide-frame .slide-surface').length,
+      emptyFrames: document.getElementById('root').shadowRoot.querySelectorAll('.slide-frame .slide-surface[data-snapshot^="blank:"]').length,
+      actualText: frame?.shadowRoot?.querySelector('.snapshot-viewport')?.textContent?.trim() };
   });
   if (target.content === '' && rendering.actualText !== '') throw new Error('The visible document must actually contain the confirmed empty page');
   // Early execution must survive the rest of the original audio and the cloud
