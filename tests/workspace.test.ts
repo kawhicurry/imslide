@@ -145,8 +145,8 @@ test('all presentation styles survive copy/reopen and reach text and voice model
         const before=f.requests.length;
         await f.run('finish',{},voice);
         assert.equal(f.requests.length-before,1);
-        const messages=JSON.stringify(f.requests.at(-1).messages);
-        assert.ok(messages.includes(presentationStyles[style].prompt));
+        const messages=f.requests.at(-1).messages.map((message:{content:string})=>message.content).join('\n');
+        assert.ok(messages.includes(JSON.stringify(presentationStyles[style].prompt).slice(1,-1)));
         assert.ok(messages.includes('designGuidance'));
       }
       await f.core.workspaceAction({tool:'switch_mode',mode:'management'});

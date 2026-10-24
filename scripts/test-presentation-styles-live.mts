@@ -45,6 +45,16 @@ try {
       const id=runtime.core.snapshot().pages[0].id;
       const surface=page.locator(`.slide-frame .slide-surface[data-page-id="${id}"]`);
       await surface.locator('.snapshot-viewport').waitFor({timeout:30000});
+      if(style==='technology') {
+        const canvas=surface.locator('.tech-canvas');await canvas.waitFor();
+        const coverage=await canvas.evaluate((el:HTMLElement)=>{
+          const a=el.getBoundingClientRect(),b=el.closest('.snapshot-viewport')!.getBoundingClientRect();
+          return {background:getComputedStyle(el).backgroundColor,radius:getComputedStyle(el).borderRadius,
+            edges:[a.left-b.left,a.top-b.top,a.right-b.right,a.bottom-b.bottom]};
+        });
+        assert.equal(coverage.background,'rgb(11, 18, 32)');assert.equal(coverage.radius,'0px');
+        assert.ok(coverage.edges.every((edge:number)=>Math.abs(edge)<1),'technology background covers the entire canvas');
+      }
       await surface.screenshot({path:resolve(out,`${style}.png`)});
       const overflow=await surface.locator('.snapshot-viewport').evaluate((el:HTMLElement)=>{
         const bounds=el.getBoundingClientRect(),walker=document.createTreeWalker(el,NodeFilter.SHOW_TEXT),bad:string[]=[];
