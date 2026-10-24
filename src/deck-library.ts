@@ -3,10 +3,10 @@ import { basename, dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { initialDeck, parseDeck, renderDeck, type Deck } from '../imslide.ts';
-import { modeSchema, WorkspaceError, type WorkspaceAction, type WorkspaceState } from './workspace-contract.ts';
+import { modeSchema, presentationStyleSchema, WorkspaceError, type WorkspaceAction, type WorkspaceState } from './workspace-contract.ts';
 const catalogSchema = z.object({
   mode: modeSchema, activeDeckId: z.string().nullable(), workspaceRevision: z.number().int().nonnegative(),
-  decks: z.array(z.object({id:z.string(),title:z.string(),file:z.string(),pageCount:z.number(),current:z.number().int().nonnegative(),updatedAt:z.string(),deletedAt:z.string().optional()})),
+  decks: z.array(z.object({id:z.string(),title:z.string(),file:z.string(),pageCount:z.number(),current:z.number().int().nonnegative(),updatedAt:z.string(),deletedAt:z.string().optional(),style:presentationStyleSchema.optional()})),
 });
 type Catalog = z.infer<typeof catalogSchema>;
 export function renderEntry(file: string) { return resolve(dirname(file), `.${basename(file, '.md')}.active.md`); }
@@ -76,15 +76,17 @@ export class DeckLibrary {
     } else if(action.tool==='create_deck' || action.tool==='duplicate_deck') {
       let content=initialDeck();
       let name=action.title;
+      let style=action.tool==='create_deck' ? action.style : undefined;
       if(action.tool==='duplicate_deck') {
         const source=next.decks.find(d=>d.id===action.deckId && !d.deletedAt);
         if(!source)throw new WorkspaceError('DECK_NOT_FOUND','文稿不存在');
         content=parseDeck(await readFile(source.file,'utf8'));content.pages.forEach(p=>p.id=randomUUID());content.revision=0;content.current=0;
         name ||= `${source.title} 副本`;
+        style=source.style;
       }
       deckId=randomUUID();const file=resolve(dirname(this.catalogFile),'decks',`${deckId}.md`);
       await atomic(file,renderDeck(content));
-      next.decks.push({id:deckId,title:name!,file,current:0,pageCount:content.pages.length,updatedAt:new Date().toISOString()});
+      next.decks.push({id:deckId,title:name!,file,current:0,pageCount:content.pages.length,updatedAt:new Date().toISOString(),style});
     } else {
       const item=next.decks.find(d=>d.id===action.deckId);
       if(!item || (action.tool!=='restore_deck' && item.deletedAt))throw new WorkspaceError('DECK_NOT_FOUND','文稿不存在，请用 list_decks 查询有效ID');

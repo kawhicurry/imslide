@@ -129,3 +129,30 @@ test('legacy Markdown without IDs is preserved and its normalized copy has stabl
     const second=await ImSlide.open({file,library:true});assert.equal(second.snapshot().pages[0].id,id);assert.equal(await readFile(file,'utf8'),original);await second.close();
   }finally{await rm(dir,{recursive:true,force:true});}
 });
+
+test('all presentation styles survive copy/reopen and reach text and voice model context',async()=>{
+  const {presentationStyles}=await import('../src/presentation-styles.ts');
+  const f=await fixture();try {
+    assert.equal(f.core.workspace().decks[0].style,undefined);
+    for(const style of Object.keys(presentationStyles) as Array<keyof typeof presentationStyles>) {
+      const created=await f.core.workspaceAction({tool:'create_deck',title:style,style});
+      const copied=await f.core.workspaceAction({tool:'duplicate_deck',deckId:created.deckId!});
+      assert.equal(f.core.workspace().decks.find(d=>d.id===copied.deckId)?.style,style);
+      await f.core.workspaceAction({tool:'open_deck',deckId:created.deckId!});
+      const reopened=await ImSlide.open({file:f.file,library:true});
+      assert.equal(reopened.workspace().decks.find(d=>d.id===created.deckId)?.style,style);await reopened.close();
+      for(const voice of [false,true]) {
+        const before=f.requests.length;
+        await f.run('finish',{},voice);
+        assert.equal(f.requests.length-before,1);
+        const messages=JSON.stringify(f.requests.at(-1).messages);
+        assert.ok(messages.includes(presentationStyles[style].prompt));
+        assert.ok(messages.includes('designGuidance'));
+      }
+      await f.core.workspaceAction({tool:'switch_mode',mode:'management'});
+    }
+    const before=JSON.stringify(f.core.workspace());
+    await assert.rejects(f.core.workspaceAction({tool:'create_deck',title:'bad',style:'unknown'} as any));
+    assert.equal(JSON.stringify(f.core.workspace()),before);
+  }finally{await f.close();}
+});

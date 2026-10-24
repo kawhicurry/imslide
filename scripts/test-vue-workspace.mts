@@ -104,7 +104,11 @@ try{
     else {await runtime.core.workspaceAction({tool:'switch_mode',mode:name==='文稿管理'?'management':'preview'});await page.waitForFunction(()=>!document.fullscreenElement);}
   }});
   await mode('文稿管理').click();await page.getByRole('heading',{name:'我的文稿'}).waitFor();
+  assert.equal(await page.getByRole('combobox',{name:'文稿风格'}).locator('option').count(),5);
+  await page.getByRole('combobox',{name:'文稿风格'}).selectOption('technology');
+  await page.screenshot({path:resolve(out,'style-selector.png')});
   await page.getByRole('textbox',{name:'新文稿名称'}).fill('第二份文稿');await page.getByRole('button',{name:'新建文稿',exact:true}).click();
+  await page.locator('.deck-card').filter({hasText:'第二份文稿'}).getByText(/科技未来风/).waitFor();
   const card=page.locator('.deck-card').filter({has:page.getByRole('heading',{name:'第二份文稿',exact:true})});await card.waitFor();
   await card.getByRole('button',{name:'重命名',exact:true}).click();await page.getByRole('textbox',{name:'重命名文稿'}).fill('切换验收');await page.getByRole('button',{name:'保存',exact:true}).click();
   await page.getByRole('button',{name:'打开文稿：切换验收',exact:true}).click();

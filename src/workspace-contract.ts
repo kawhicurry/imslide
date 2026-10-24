@@ -1,7 +1,9 @@
 import { z } from 'zod';
+import { styleIds, type PresentationStyle } from './presentation-styles.ts';
+export const presentationStyleSchema = z.enum(styleIds);
 export const modeSchema = z.enum(['management', 'preview', 'presentation']);
 export type WorkspaceMode = z.infer<typeof modeSchema>;
-export type DeckSummary = { id: string; title: string; pageCount: number; updatedAt: string; deletedAt?: string };
+export type DeckSummary = { id: string; title: string; pageCount: number; updatedAt: string; deletedAt?: string; style?: PresentationStyle };
 export type WorkspaceState = { mode: WorkspaceMode; activeDeckId: string | null; workspaceRevision: number; decks: DeckSummary[] };
 const title = z.string().trim().min(1).max(120);
 const target = { deckId: z.string().min(1).max(80) };
@@ -9,7 +11,7 @@ export const workspaceActions = [
   z.object({ tool: z.literal('get_workspace') }),
   z.object({ tool: z.literal('switch_mode'), mode: modeSchema }),
   z.object({ tool: z.literal('list_decks'), query: z.string().max(120).optional(), deleted: z.boolean().default(false) }),
-  z.object({ tool: z.literal('create_deck'), title }),
+  z.object({ tool: z.literal('create_deck'), title, style: presentationStyleSchema.optional().describe('生成风格：business商务稳重、technology科技未来、academic学术科研、humanities创意人文、minimal极简汇报') }),
   z.object({ tool: z.literal('open_deck'), ...target }),
   z.object({ tool: z.literal('rename_deck'), ...target, title }),
   z.object({ tool: z.literal('duplicate_deck'), ...target, title: title.optional() }),

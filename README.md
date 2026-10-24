@@ -286,3 +286,7 @@ MOSS 模式也需要先安装 `scripts/asr-requirements.txt`，但不需要下�
 Slidev 的内部 Vue 接口集中在 `src/slidev-api.d.ts` 与 `src/slidev-wrapper.d.ts` 的类型边界，锁定52.20.1；升级时必须重新验证编译、主题样式与HMR。5173入口采用内存路由，页面选择仍由 `/api/view` 和文稿中的稳定页面ID控制。生产构建固定包含构建时的页面；持续编辑需要运行开发编译服务。
 
 多文稿验证：`npm test` 包含权限矩阵、持久化、模式切换、过期任务和语音批量工具测试。`tsx scripts/test-vue-workspace.mts` 使用真实后端、Slidev 和 Chromium，在独立目录运行多文稿浏览器回归；可通过 `PLAYWRIGHT_MODULE` 指定 Playwright 路径。加 `TEST_LIVE_ASR=1` 使用已配置的真实 SeedASR 静音流验证跨模式不断连。`tsx scripts/test-library-voice-live.mts` 使用已配置的真实模型验证累计语音转写到多文稿工具的完整流程，产生正常模型用量，所有文稿隔离在 `.data/`。
+
+## 演示风格与提示词
+
+新建文稿时可选商务稳重、科技未来、学术科研、创意人文、极简汇报五种风格，文字和语音编辑共用文稿风格上下文。两份可独立复制的提示词（整套生成、保真重构）、使用方法和检索依据见 [提示词库](prompts/README.md)。

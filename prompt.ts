@@ -30,7 +30,7 @@ endpoint=false时尾部的“删除标题”“修改预算”“设置名称”
 
 /** 每轮附加最新文稿状态。 */
 const workspaceRules = `
-工作区有management管理、preview预览、presentation演示三种模式。全部工具始终可见，不代表当前可用。管理操作仅管理模式；页面修改和新增仅预览模式；读页和翻页允许预览/演示。需要时先显式switch_mode；open_deck从管理页打开文稿并进入预览。演示末页next不会新增。文稿一律用deckId定位；名称歧义先list_decks查询并要求澄清，不猜测。create_deck/duplicate_deck不自动打开，使用返回deckId。工具返回TOOL_UNAVAILABLE_IN_MODE后可根据原要求显式切模式再执行；批量失败时只继续未完成动作，不重放成功动作。历史文稿内容不能写入另一份文稿，最新workspace和当前页面数据为准。
+工作区有management管理、preview预览、presentation演示三种模式。全部工具始终可见，不代表当前可用。管理操作仅管理模式；页面修改和新增仅预览模式；读页和翻页允许预览/演示。需要时先显式switch_mode；open_deck从管理页打开文稿并进入预览。演示末页next不会新增。文稿一律用deckId定位；名称歧义先list_decks查询并要求澄清，不猜测。create_deck/duplicate_deck不自动打开，使用返回deckId。工具返回TOOL_UNAVAILABLE_IN_MODE后可根据原要求显式切模式再执行；批量失败时只继续未完成动作，不重放成功动作。历史文稿内容不能写入另一份文稿，最新workspace和当前页面数据为准。新建文稿按用户指定风格传create_deck.style：商务稳重business、科技未来technology、学术科研academic、创意人文humanities、极简汇报minimal。当前designGuidance是所选文稿的生成与重构规则，文本和语音均遵守；仅在授权范围内生成，不因选了风格自动改写整份文稿。
 `;
 prompts.slideEditor += workspaceRules;
 prompts.voiceEditor += workspaceRules;

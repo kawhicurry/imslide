@@ -7,6 +7,7 @@ import 'dotenv/config';
 import { DeckLibrary } from './src/deck-library.ts';
 import { checkMode, workspaceActions, workspaceActionSchema, workspaceDescriptions, WorkspaceError, type WorkspaceAction, type WorkspaceState } from './src/workspace-contract.ts';
 import { prompts, slideEditorSystemPrompt } from './prompt.ts';
+import { stylePrompt } from './src/presentation-styles.ts';
 import express from 'express';
 import { TranscriptMerger, calibrator, mergeSchema, type MergeInput } from './src/transcript-merger.ts';
 import { paragraphText } from './src/paragraphs.ts';
@@ -282,7 +283,9 @@ export class ImSlide {
     const current = this.deck.pages[this.deck.current];
     const fingerprint = JSON.stringify(current);
     const unchanged = known?.get(current.id) === fingerprint;
-    return { workspace: this.workspace(), currentPage: this.deck.current + 1, revision: this.deck.revision,
+    const workspace = this.workspace();
+    const style = workspace.decks.find(item => item.id === workspace.activeDeckId)?.style;
+    return { workspace, designGuidance: stylePrompt(style), currentPage: this.deck.current + 1, revision: this.deck.revision,
       pages: this.deck.pages.map(({ title, layout }, index) => ({ page: index + 1, title, layout })),
       ...(unchanged ? { currentContentUnchanged: true } : { currentContent: current.content }) };
   }
