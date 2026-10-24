@@ -148,6 +148,10 @@ test('all presentation styles survive copy/reopen and reach text and voice model
         const messages=f.requests.at(-1).messages.map((message:{content:string})=>message.content).join('\n');
         assert.ok(messages.includes(JSON.stringify(presentationStyles[style].prompt).slice(1,-1)));
         assert.ok(messages.includes('designGuidance'));
+        const {layoutRhythm}=await import('../src/presentation-layouts.ts');
+        assert.ok(messages.includes(layoutRhythm),'text and voice both receive layout rhythm rules');
+        assert.ok(messages.includes('代码＋解释'));
+        assert.ok(messages.includes('公式／方法＋结果'));
       }
       await f.core.workspaceAction({tool:'switch_mode',mode:'management'});
     }
